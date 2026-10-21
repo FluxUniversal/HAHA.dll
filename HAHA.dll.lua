@@ -5,6 +5,7 @@ local TweenService = game:GetService("TweenService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Stats = game:GetService("Stats")
 local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
 
 local LocalPlayer = Players.LocalPlayer
 local localName = LocalPlayer.Name
@@ -26,6 +27,72 @@ local CONFIG = {
 
 local unlimitedKbps = false
 local payloadRefreshThreshold = 0.016
+local screenRefreshThreshold = 0.016
+local lastScreenRefresh = 0
+
+local aliveFolderCache = nil
+local aliveFolderCacheAt = 0
+local function getAliveFolder()
+    local now = os.clock()
+    if now - aliveFolderCacheAt > 2 then
+        aliveFolderCache = ws:FindFirstChild("Alive")
+        aliveFolderCacheAt = now
+    end
+    return aliveFolderCache
+end
+
+local pingSmoothed = 0
+local pingJitter = 0
+local lastPingSample = 0
+local lastPingSampleTime = 0
+local cachedEffectiveAccuracy = 85
+local lastAccuracyCalc = 0
+
+local function updateAccuracyEstimate()
+    local now = os.clock()
+    if now - lastPingSampleTime >= 0.2 then
+        lastPingSampleTime = now
+        local raw = dataPing:GetValue()
+        if pingSmoothed == 0 then
+            pingSmoothed = raw
+            lastPingSample = raw
+        else
+            local delta = math.abs(raw - lastPingSample)
+            lastPingSample = raw
+            pingJitter = pingJitter * 0.8 + delta * 0.2
+            pingSmoothed = pingSmoothed * 0.7 + raw * 0.3
+        end
+    end
+
+    if now - lastAccuracyCalc >= 0.5 then
+        lastAccuracyCalc = now
+        if CONFIG.AccuracyMode ~= "auto" then
+            cachedEffectiveAccuracy = CONFIG.Accuracy
+        else
+            local p = pingSmoothed
+            local pingFactor
+            if p <= 80 then
+                pingFactor = 1
+            elseif p >= 2000 then
+                pingFactor = 0.35
+            else
+                pingFactor = 1 - ((p - 80) / 1920) * 0.65
+            end
+            local jitterFactor = math.clamp(1 - (pingJitter / 300), 0.6, 1)
+            cachedEffectiveAccuracy = CONFIG.Accuracy * pingFactor * jitterFactor
+        end
+    end
+end
+
+local function getEffectiveAccuracy()
+    updateAccuracyEstimate()
+    return cachedEffectiveAccuracy
+end
+
+local function getAccuracyMultiplier()
+    updateAccuracyEstimate()
+    return 100 / cachedEffectiveAccuracy
+end
 
 local remotesHook = {
     mt = {}, orig = {}, captured = {}, tokenFn = nil, firstSignal = nil,
@@ -172,20 +239,21 @@ local function fastTokenize()
     return table.concat(tokenBuf, "", 1, n)
 end
 
-local lastTokenStamp = -1
+local lastTokenGenTime = 0
+local tokenRegenInterval = 0.03
 local cachedToken = ""
 
 local function refreshCachedToken()
     if not hotSigLen or not hotSigBytes then return end
-    local stamp = math.floor(GetServerTimeNow(ws) * 100)
-    if stamp == lastTokenStamp then return end
-    lastTokenStamp = stamp
-    local stampStr = tostring(stamp)
-    local n = #stampStr
+    local now = os.clock()
+    if now - lastTokenGenTime < tokenRegenInterval then return end
+    lastTokenGenTime = now
+    local stamp = tostring(math.floor(GetServerTimeNow(ws) * 100))
+    local n = #stamp
     local sig = hotSigBytes
     local sigLen = hotSigLen
     for i = 1, n do
-        tokenBuf[i] = string.char(bit32.bxor((string.byte(stampStr, i) + i) % 256, sig[(i - 1) % sigLen + 1]))
+        tokenBuf[i] = string.char(bit32.bxor((string.byte(stamp, i) + i) % 256, sig[(i - 1) % sigLen + 1]))
     end
     cachedToken = table.concat(tokenBuf, "", 1, n)
 end
@@ -196,19 +264,26 @@ local cachedCframe
 local cachedScale = 0.5
 local lastPayloadRefresh = 0
 
+local cachedTargetPos = nil
+local lastTargetRefresh = 0
+local targetRefreshInterval = 0.1
+
 local function getTarget()
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
     if not root then return nil end
     local best, dist
+    local rootPos = root.Position
     for _, other in ipairs(Players:GetPlayers()) do
         if other ~= LocalPlayer and other.Character then
             local otherRoot = other.Character:FindFirstChild("HumanoidRootPart")
-            local humanoid = other.Character:FindFirstChildOfClass("Humanoid")
-            if otherRoot and humanoid and humanoid.Health > 0 then
-                local d = (otherRoot.Position - root.Position).Magnitude
-                if not dist or d < dist then
-                    dist, best = d, otherRoot.Position
+            if otherRoot then
+                local humanoid = other.Character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    local d = (otherRoot.Position - rootPos).Magnitude
+                    if not dist or d < dist then
+                        dist, best = d, otherRoot.Position
+                    end
                 end
             end
         end
@@ -216,30 +291,44 @@ local function getTarget()
     return best
 end
 
+local function refreshTarget()
+    local now = os.clock()
+    if now - lastTargetRefresh < targetRefreshInterval then return end
+    lastTargetRefresh = now
+    cachedTargetPos = getTarget()
+end
+
 local function refreshPayload()
     local now = os.clock()
     if now - lastPayloadRefresh < payloadRefreshThreshold then return end
     lastPayloadRefresh = now
+
+    refreshTarget()
+
     cachedScale = CONFIG.FireArg
-    local target = getTarget()
-    if target then
-        cachedCframe = CFrame.new(Camera.CFrame.Position, target)
+    local camCFrame = Camera.CFrame
+    if cachedTargetPos then
+        cachedCframe = CFrame.new(camCFrame.Position, cachedTargetPos)
     else
-        cachedCframe = Camera.CFrame
+        cachedCframe = camCFrame
     end
-    table.clear(cachedScreen)
-    local aliveFolder = ws:FindFirstChild("Alive")
-    if aliveFolder then
-        for _, char in ipairs(aliveFolder:GetChildren()) do
-            local hrp = char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                cachedScreen[char.Name] = Camera:WorldToScreenPoint(hrp.Position)
+
+    if now - lastScreenRefresh >= screenRefreshThreshold then
+        lastScreenRefresh = now
+        table.clear(cachedScreen)
+        local aliveFolder = getAliveFolder()
+        if aliveFolder then
+            for _, char in ipairs(aliveFolder:GetChildren()) do
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    cachedScreen[char.Name] = Camera:WorldToScreenPoint(hrp.Position)
+                end
             end
         end
+        local vp = Camera.ViewportSize
+        cachedAim[1] = vp.X / 2
+        cachedAim[2] = vp.Y / 2
     end
-    local vp = Camera.ViewportSize
-    cachedAim[1] = vp.X / 2
-    cachedAim[2] = vp.Y / 2
 end
 
 local function fireServer()
@@ -268,11 +357,7 @@ local function fireServer()
     refreshPayload()
     if not cachedCframe then cachedCframe = Camera.CFrame end
     local tok = fastTokenize()
-    if hotIsEvent then
-        hotRemote:FireServer(hotArgs1, hotArgs2, tok, cachedScale, cachedCframe, cachedScreen, cachedAim, false)
-    else
-        hotRemote:InvokeServer(hotArgs1, hotArgs2, tok, cachedScale, cachedCframe, cachedScreen, cachedAim, false)
-    end
+    fireMethod(hotRemote, hotArgs1, hotArgs2, tok, cachedScale, cachedCframe, cachedScreen, cachedAim, false)
     return true
 end
 
@@ -343,11 +428,7 @@ local function triggerFire(ball)
     refreshPayload()
     local cf = CFrame.new(Camera.CFrame.Position, ballPositions[ball] or ball.Position)
     local tok = fastTokenize()
-    if hotIsEvent then
-        hotRemote:FireServer(hotArgs1, hotArgs2, tok, cachedScale, cf, cachedScreen, cachedAim, false)
-    else
-        hotRemote:InvokeServer(hotArgs1, hotArgs2, tok, cachedScale, cf, cachedScreen, cachedAim, false)
-    end
+    fireMethod(hotRemote, hotArgs1, hotArgs2, tok, cachedScale, cf, cachedScreen, cachedAim, false)
 end
 
 local function isCurved(ball)
@@ -356,7 +437,7 @@ local function isCurved(ball)
     local char = LocalPlayer.Character
     if not char or not char.PrimaryPart then return false end
     local t = os.clock()
-    local ping = dataPing:GetValue()
+    local ping = pingSmoothed > 0 and pingSmoothed or dataPing:GetValue()
     local vel = zoomies.VectorVelocity
     local speed = vel.Magnitude
     if speed < 0.1 then return false end
@@ -415,14 +496,179 @@ task.spawn(function()
     end
 end)
 
+local noRender = {
+    enabled = false,
+    saved = setmetatable({}, {__mode = "k"}),
+    count = 0,
+}
+
+local noRenderClasses = {
+    ParticleEmitter = true,
+    Trail = true,
+    Beam = true,
+    Smoke = true,
+    Fire = true,
+    Sparkles = true,
+    PointLight = true,
+    SpotLight = true,
+    SurfaceLight = true,
+}
+
+local function saveEnabled(inst)
+    local s = noRender.saved[inst]
+    if not s then
+        s = {}
+        noRender.saved[inst] = s
+    end
+    if s.Enabled == nil then
+        local ok, v = pcall(function() return inst.Enabled end)
+        if ok then
+            s.Enabled = v
+            noRender.count = noRender.count + 1
+        end
+    end
+    pcall(function() inst.Enabled = false end)
+end
+
+local function applyNoRender()
+    noRender.count = 0
+
+    local s = noRender.saved[Lighting]
+    if not s then
+        s = {}
+        noRender.saved[Lighting] = s
+    end
+    s.Ambient = Lighting.Ambient
+    s.OutdoorAmbient = Lighting.OutdoorAmbient
+    s.Brightness = Lighting.Brightness
+    s.GlobalShadows = Lighting.GlobalShadows
+    pcall(function() s.EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale end)
+    pcall(function() s.EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale end)
+    s.FogEnd = Lighting.FogEnd
+    s.FogStart = Lighting.FogStart
+    pcall(function() s.ClockTime = Lighting.ClockTime end)
+
+    Lighting.Ambient = Color3.new(0, 0, 0)
+    Lighting.OutdoorAmbient = Color3.new(0, 0, 0)
+    Lighting.Brightness = 1
+    Lighting.GlobalShadows = false
+    pcall(function() Lighting.EnvironmentDiffuseScale = 0 end)
+    pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+    Lighting.FogEnd = 1e10
+    Lighting.FogStart = 0
+
+    for _, c in ipairs(Lighting:GetChildren()) do
+        if c:IsA("PostEffect") then
+            saveEnabled(c)
+        elseif c:IsA("Atmosphere") then
+            local as = noRender.saved[c]
+            if not as then as = {}; noRender.saved[c] = as end
+            if as.Density == nil then as.Density = c.Density; noRender.count = noRender.count + 1 end
+            c.Density = 0
+        elseif c:IsA("Clouds") then
+            local cs = noRender.saved[c]
+            if not cs then cs = {}; noRender.saved[c] = cs end
+            if cs.Cover == nil then cs.Cover = c.Cover; noRender.count = noRender.count + 1 end
+            c.Cover = 0
+        elseif c:IsA("Sky") then
+            local ks = noRender.saved[c]
+            if not ks then ks = {}; noRender.saved[c] = ks end
+            ks.SkyboxBk = c.SkyboxBk
+            ks.SkyboxDn = c.SkyboxDn
+            ks.SkyboxFt = c.SkyboxFt
+            ks.SkyboxLf = c.SkyboxLf
+            ks.SkyboxRt = c.SkyboxRt
+            ks.SkyboxUp = c.SkyboxUp
+            ks.SunTextureId = c.SunTextureId
+            ks.MoonTextureId = c.MoonTextureId
+            noRender.count = noRender.count + 1
+            c.SkyboxBk = ""
+            c.SkyboxDn = ""
+            c.SkyboxFt = ""
+            c.SkyboxLf = ""
+            c.SkyboxRt = ""
+            c.SkyboxUp = ""
+            c.SunTextureId = ""
+            c.MoonTextureId = ""
+        end
+    end
+
+    for _, d in ipairs(ws:GetDescendants()) do
+        if noRenderClasses[d.ClassName] then
+            saveEnabled(d)
+        end
+    end
+end
+
+local function restoreNoRender()
+    for inst, s in next, noRender.saved do
+        if inst == Lighting then
+            pcall(function()
+                if s.Ambient then Lighting.Ambient = s.Ambient end
+                if s.OutdoorAmbient then Lighting.OutdoorAmbient = s.OutdoorAmbient end
+                if s.Brightness then Lighting.Brightness = s.Brightness end
+                if s.GlobalShadows ~= nil then Lighting.GlobalShadows = s.GlobalShadows end
+                if s.EnvironmentDiffuseScale then Lighting.EnvironmentDiffuseScale = s.EnvironmentDiffuseScale end
+                if s.EnvironmentSpecularScale then Lighting.EnvironmentSpecularScale = s.EnvironmentSpecularScale end
+                if s.FogEnd then Lighting.FogEnd = s.FogEnd end
+                if s.FogStart then Lighting.FogStart = s.FogStart end
+                if s.ClockTime then Lighting.ClockTime = s.ClockTime end
+            end)
+        elseif inst:IsA("Atmosphere") then
+            if s.Density ~= nil then pcall(function() inst.Density = s.Density end) end
+        elseif inst:IsA("Clouds") then
+            if s.Cover ~= nil then pcall(function() inst.Cover = s.Cover end) end
+        elseif inst:IsA("Sky") then
+            pcall(function()
+                if s.SkyboxBk then inst.SkyboxBk = s.SkyboxBk end
+                if s.SkyboxDn then inst.SkyboxDn = s.SkyboxDn end
+                if s.SkyboxFt then inst.SkyboxFt = s.SkyboxFt end
+                if s.SkyboxLf then inst.SkyboxLf = s.SkyboxLf end
+                if s.SkyboxRt then inst.SkyboxRt = s.SkyboxRt end
+                if s.SkyboxUp then inst.SkyboxUp = s.SkyboxUp end
+                if s.SunTextureId then inst.SunTextureId = s.SunTextureId end
+                if s.MoonTextureId then inst.MoonTextureId = s.MoonTextureId end
+            end)
+        else
+            if s.Enabled ~= nil then
+                pcall(function() inst.Enabled = s.Enabled end)
+            end
+        end
+    end
+    table.clear(noRender.saved)
+    noRender.count = 0
+end
+
+local wsDescConn = nil
+
+local function enableNoRender()
+    if noRender.enabled then return end
+    noRender.enabled = true
+    applyNoRender()
+    wsDescConn = ws.DescendantAdded:Connect(function(d)
+        if noRenderClasses[d.ClassName] then
+            saveEnabled(d)
+        end
+    end)
+end
+
+local function disableNoRender()
+    if not noRender.enabled then return end
+    noRender.enabled = false
+    if wsDescConn then
+        wsDescConn:Disconnect()
+        wsDescConn = nil
+    end
+    restoreNoRender()
+end
+
 local spamState = {
     enabled = false,
     rate = 100,
-    interval = 1 / 100,
     accumulator = 0,
     lastFrame = os.clock(),
     maxDt = 0.05,
-    maxGuard = 30,
+    maxGuard = 20,
 }
 
 local function doSpamTick()
@@ -435,17 +681,19 @@ local function doSpamTick()
     local now = os.clock()
     local dt = now - spamState.lastFrame
     spamState.lastFrame = now
-    if dt > spamState.maxDt then dt = spamState.maxDt end
+    local maxDt = spamState.maxDt
+    if dt > maxDt then dt = maxDt end
 
-    local acc = spamState.accumulator + dt
-    if acc < spamState.interval then
+    local acc = spamState.accumulator + dt * spamState.rate
+    if acc < 1 then
         spamState.accumulator = acc
         return
     end
 
-    local count = math.floor(acc / spamState.interval)
-    if count > spamState.maxGuard then count = spamState.maxGuard end
-    spamState.accumulator = acc - count * spamState.interval
+    local guard = spamState.maxGuard
+    if acc > guard then acc = guard end
+    local count = math.floor(acc)
+    spamState.accumulator = acc - count
 
     refreshPayload()
     refreshCachedToken()
@@ -459,12 +707,25 @@ local function doSpamTick()
 end
 
 RunService.PreSimulation:Connect(doSpamTick)
+RunService.Heartbeat:Connect(doSpamTick)
 
-RunService.Heartbeat:Connect(function()
-    if unlimitedKbps then
-        doSpamTick()
+local renderTickConn = nil
+local function setUnlimitedKbps(enabled)
+    unlimitedKbps = enabled
+    screenRefreshThreshold = enabled and 1.0 or 0.016
+    payloadRefreshThreshold = 0.016
+    spamState.maxDt = enabled and 0.15 or 0.05
+    spamState.maxGuard = enabled and 60 or 20
+    spamState.accumulator = 0
+    spamState.lastFrame = os.clock()
+
+    if enabled and not renderTickConn then
+        renderTickConn = RunService.RenderStepped:Connect(doSpamTick)
+    elseif not enabled and renderTickConn then
+        renderTickConn:Disconnect()
+        renderTickConn = nil
     end
-end)
+end
 
 local C = {
     bg = Color3.fromRGB(28, 28, 32),
@@ -513,8 +774,8 @@ ScreenGui.DisplayOrder = 999
 ScreenGui.Parent = PlayerGui
 
 local Shadow = Instance.new("Frame")
-Shadow.Size = UDim2.new(0, 264, 0, 512)
-Shadow.Position = UDim2.new(0.5, -132, 0.5, -256)
+Shadow.Size = UDim2.new(0, 264, 0, 564)
+Shadow.Position = UDim2.new(0.5, -132, 0.5, -282)
 Shadow.BackgroundColor3 = Color3.new(0, 0, 0)
 Shadow.BackgroundTransparency = 0.5
 Shadow.BorderSizePixel = 0
@@ -522,8 +783,8 @@ Shadow.Parent = ScreenGui
 Instance.new("UICorner", Shadow).CornerRadius = UDim.new(0, 14)
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 260, 0, 508)
-MainFrame.Position = UDim2.new(0.5, -130, 0.5, -254)
+MainFrame.Size = UDim2.new(0, 260, 0, 560)
+MainFrame.Position = UDim2.new(0.5, -130, 0.5, -280)
 MainFrame.BackgroundColor3 = C.bg
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
@@ -756,28 +1017,6 @@ end
 
 local AutoParry = false
 
-local function getEffectiveAccuracy()
-    if CONFIG.AccuracyMode ~= "auto" then
-        return CONFIG.Accuracy
-    end
-    local ping = dataPing:GetValue()
-
-    if ping <= 80 then
-        return CONFIG.Accuracy
-    elseif ping >= 2580 then
-        return CONFIG.Accuracy * 0.35
-    else
-        local range = ping - 80
-        local factor = 1 - (range / 2500)
-        return CONFIG.Accuracy * math.max(factor, 0.35)
-    end
-end
-
-local function getAccuracyMultiplier()
-    local eff = getEffectiveAccuracy()
-    return 100 / eff
-end
-
 makeToggleRow(52, "Auto parry", function(s)
     AutoParry = s
 end)
@@ -789,20 +1028,18 @@ makeToggleRow(104, "Manual spam", function(s)
 end)
 
 makeToggleRow(156, "Unlimited KBPS", function(s)
-    unlimitedKbps = s
-    payloadRefreshThreshold = s and 0.15 or 0.016
-    spamState.maxDt = s and 0.15 or 0.05
-    spamState.maxGuard = s and 100 or 30
-    spamState.accumulator = 0
-    spamState.lastFrame = os.clock()
+    setUnlimitedKbps(s)
 end)
 
-makeSlider(208, "Spam rate (/s)", 100, 500, spamState.rate, function(v)
+makeToggleRow(208, "No Render", function(s)
+    if s then enableNoRender() else disableNoRender() end
+end)
+
+makeSlider(260, "Spam rate (/s)", 100, 500, spamState.rate, function(v)
     spamState.rate = v
-    spamState.interval = 1 / v
 end)
 
-makeToggleRow(272, "Triggerbot", function(s)
+makeToggleRow(324, "Triggerbot", function(s)
     triggerEnabled = s
     if s then
         for _, ball in ipairs(getRealBalls()) do
@@ -811,17 +1048,18 @@ makeToggleRow(272, "Triggerbot", function(s)
     end
 end)
 
-local accuracySlider = makeSlider(324, "Accuracy", 40, 100, CONFIG.Accuracy, function(v)
+local accuracySlider = makeSlider(376, "Accuracy", 40, 100, CONFIG.Accuracy, function(v)
     CONFIG.Accuracy = v
 end)
 
-makeToggleRow(388, "Auto accuracy", function(s)
+makeToggleRow(440, "Auto accuracy", function(s)
     CONFIG.AccuracyMode = s and "auto" or "manual"
+    lastAccuracyCalc = 0
 end)
 
 local StatsCard = Instance.new("Frame")
 StatsCard.Size = UDim2.new(1, -32, 0, 56)
-StatsCard.Position = UDim2.new(0, 16, 0, 440)
+StatsCard.Position = UDim2.new(0, 16, 0, 492)
 StatsCard.BackgroundColor3 = C.card
 StatsCard.BorderSizePixel = 0
 StatsCard.Parent = MainFrame
@@ -923,7 +1161,7 @@ local function checkParry()
     if ballDebounce or t < ballUntilAt then return end
     if not remotesHook.tokenFn then return end
     local pos = hrp.Position
-    local pingVal = dataPing:GetValue()
+    local pingVal = pingSmoothed > 0 and pingSmoothed or dataPing:GetValue()
     local pingRange = math.clamp(pingVal / 100, 5, 18)
     local accuracyMult = getAccuracyMultiplier()
     local allBalls = getRealBalls()
@@ -979,20 +1217,22 @@ task.spawn(function()
             end
         end
         if maxSpeed > 0 then
-            VelocityValue.Text = string.format("%.0f", maxSpeed)
+            local vText = string.format("%.0f", maxSpeed)
+            if VelocityValue.Text ~= vText then VelocityValue.Text = vText end
             VelocityValue.TextColor3 = maxSpeed >= 2200 and C.warnColor or C.text
         else
-            VelocityValue.Text = "--"
+            if VelocityValue.Text ~= "--" then VelocityValue.Text = "--" end
             VelocityValue.TextColor3 = C.textDim
         end
 
-        local ping = dataPing:GetValue()
-        PingValue.Text = string.format("%.0fms", ping)
+        local ping = pingSmoothed > 0 and pingSmoothed or dataPing:GetValue()
+        local pText = string.format("%.0fms", ping)
+        if PingValue.Text ~= pText then PingValue.Text = pText end
         PingValue.TextColor3 = ping > 200 and C.warnColor or C.text
 
         if CONFIG.AccuracyMode == "auto" then
             local eff = getEffectiveAccuracy()
-            accuracySlider.sub.Text = string.format("auto | eff: %.0f%%", eff)
+            accuracySlider.sub.Text = string.format("auto | eff: %.0f%% | j: %.0f", eff, pingJitter)
         else
             accuracySlider.sub.Text = "manual"
         end
@@ -1063,6 +1303,8 @@ MiniButton.MouseButton2Click:Connect(function()
     alive = false
     spamState.enabled = false
     triggerEnabled = false
+    if renderTickConn then renderTickConn:Disconnect() end
+    if noRender.enabled then disableNoRender() end
     ScreenGui:Destroy()
 end)
 
