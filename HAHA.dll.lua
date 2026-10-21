@@ -103,8 +103,25 @@ local function getAccuracyMultiplier()
 end
 
 local remotesHook = {
-    mt = {}, orig = {}, captured = {}, tokenFn = nil, firstSignal = nil,
+    mt = {},
+    orig = {},
+    captured = {},
+    tokenFn = nil,
+    firstSignal = nil,
+    done = false,
+    descConn = nil,
 }
+
+local function validArgs(args)
+    return #args == 8
+        and type(args[2]) == "string"
+        and type(args[3]) == "string"
+        and type(args[4]) == "number"
+        and typeof(args[5]) == "CFrame"
+        and type(args[6]) == "table"
+        and type(args[7]) == "table"
+        and type(args[8]) == "boolean"
+end
 
 do
     local ok, gc = pcall(getgc, true)
@@ -126,17 +143,6 @@ do
     end
 end
 
-local function validArgs(args)
-    return #args == 8
-        and type(args[2]) == "string"
-        and type(args[3]) == "string"
-        and type(args[4]) == "number"
-        and typeof(args[5]) == "CFrame"
-        and type(args[6]) == "table"
-        and type(args[7]) == "table"
-        and type(args[8]) == "boolean"
-end
-
 local function unhookAll()
     for mt, idx in next, remotesHook.orig do
         pcall(function()
@@ -147,30 +153,45 @@ local function unhookAll()
     end
     table.clear(remotesHook.mt)
     table.clear(remotesHook.orig)
+    if remotesHook.descConn then
+        remotesHook.descConn:Disconnect()
+        remotesHook.descConn = nil
+    end
+    remotesHook.done = true
 end
 
 local function hookRemote(inst)
-    if next(remotesHook.captured) ~= nil then return end
+    if remotesHook.done then return end
     local ok, mt = pcall(getrawmetatable, inst)
     if not ok or remotesHook.mt[mt] then return end
     remotesHook.mt[mt] = true
     setreadonly(mt, false)
     local origIdx = mt.__index
     remotesHook.orig[mt] = origIdx
+
     mt.__index = function(self, key)
-        if (key == "FireServer" and self:IsA("RemoteEvent"))
-        or (key == "InvokeServer" and self:IsA("RemoteFunction")) then
-            return function(self2, ...)
-                local args = {...}
-                if validArgs(args) then
-                    remotesHook.captured[self] = args
-                    unhookAll()
+        if not remotesHook.done and (key == "FireServer" or key == "InvokeServer") then
+            local realFn = origIdx(self, key)
+            if realFn then
+                return function(self2, ...)
+                    if not remotesHook.done then
+                        local cls = self2.ClassName
+                        if (key == "FireServer" and cls == "RemoteEvent")
+                        or (key == "InvokeServer" and cls == "RemoteFunction") then
+                            local args = {...}
+                            if validArgs(args) then
+                                remotesHook.captured[self2] = args
+                                task.defer(unhookAll)
+                            end
+                        end
+                    end
+                    return realFn(self2, ...)
                 end
-                return origIdx(self, key)(self2, table.unpack(args))
             end
         end
         return origIdx(self, key)
     end
+
     setreadonly(mt, true)
 end
 
@@ -180,6 +201,12 @@ if getrawmetatable and setreadonly then
             pcall(hookRemote, d)
         end
     end
+    remotesHook.descConn = ReplicatedStorage.DescendantAdded:Connect(function(d)
+        if remotesHook.done then return end
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            pcall(hookRemote, d)
+        end
+    end)
 end
 
 do
@@ -228,10 +255,15 @@ local function refreshHot()
         hotArgs1 = args[1]
         hotArgs2 = args[2]
         hotIsEvent = remote:IsA("RemoteEvent")
-        fireMethod = hotIsEvent and remote.FireServer or remote.InvokeServer
+        if hotIsEvent then
+            fireMethod = remote.FireServer
+        else
+            fireMethod = remote.InvokeServer
+        end
         cacheSignature()
-        return
+        return true
     end
+    return false
 end
 
 local tokenBuf = table.create(24)
@@ -247,13 +279,8 @@ local function fastTokenize()
     return table.concat(tokenBuf, "", 1, n)
 end
 
--- ===== Token cache with two-tier reuse =====
--- stamp (100 Hz) changes at most 100 times/sec; we also cap regen to 20 Hz.
--- Additionally, we cache the token alongside the stamp it was generated
--- from, so any fire within the same 30ms window reuses the same string
--- with zero string ops.
 local lastTokenGenTime = 0
-local tokenRegenInterval = 0.05   -- 20 Hz (tokens stay <50ms stale)
+local tokenRegenInterval = 0.05
 local cachedToken = ""
 local cachedTokenStamp = -1
 
@@ -346,8 +373,8 @@ end
 
 local function fireServer()
     if not remotesHook.tokenFn then return false end
-    if not hotRemote then refreshHot() end
-    if not hotRemote then
+    if not hotRemote or not fireMethod then refreshHot() end
+    if not hotRemote or not fireMethod then
         if not remotesHook.firstSignal then
             local okSig, SignalMod = pcall(function()
                 return require(ReplicatedStorage.Packages.Signal)
@@ -428,9 +455,9 @@ local ballTriggerTimes = setmetatable({}, {__mode = "k"})
 local function triggerFire(ball)
     if not triggerEnabled then return end
     if ball:GetAttribute("target") ~= localName then return end
-    if not hotRemote then
+    if not hotRemote or not fireMethod then
         if next(remotesHook.captured) ~= nil then refreshHot() end
-        if not hotRemote then
+        if not hotRemote or not fireMethod then
             pcall(fireServer)
             return
         end
@@ -509,7 +536,6 @@ task.spawn(function()
     end
 end)
 
--- ============= No Render v2 =============
 local noRender = {
     enabled = false,
     saved = setmetatable({}, {__mode = "k"}),
@@ -530,12 +556,6 @@ local function saveProp(inst, prop)
             noRender.count = noRender.count + 1
         end
     end
-end
-
-local function disableEnabledEffect(inst)
-    if not inst.Enabled then return end
-    saveProp(inst, "Enabled")
-    pcall(function() inst.Enabled = false end)
 end
 
 local function disableTransparency(inst)
@@ -750,7 +770,6 @@ local function disableNoRender()
     restoreNoRender()
 end
 
--- ============= Spam engine v3 (bit-packed batch dispatch) =============
 local spamState = {
     enabled = false,
     rate = 100,
@@ -758,13 +777,9 @@ local spamState = {
     lastFrame = os.clock(),
     maxDt = 0.05,
     maxGuard = 20,
-    -- pre-sized argument arrays: no per-fire table allocation
     argCache = nil,
 }
 
--- We build the 9-arg call array once and reuse it. The token field
--- (index 4) is the only mutable slot; on token refresh we patch it in
--- place instead of reallocating. This avoids 500+ table constructions/s.
 local function ensureArgCache()
     if spamState.argCache then return spamState.argCache end
     local a = table.create(9)
@@ -782,10 +797,14 @@ end
 
 local function doSpamTick()
     if not spamState.enabled then return end
+
+    if not hotRemote or not fireMethod then
+        if next(remotesHook.captured) ~= nil then refreshHot() end
+        if not hotRemote or not fireMethod then return end
+    end
+
     local remote = hotRemote
-    if not remote then return end
     local method = fireMethod
-    if not method then return end
 
     local now = os.clock()
     local dt = now - spamState.lastFrame
@@ -805,30 +824,51 @@ local function doSpamTick()
     refreshPayload()
     refreshCachedToken()
 
-    -- Single shadowed local for the whole batch; no table lookups in loop.
     local a = ensureArgCache()
+    a[1] = hotArgs1
+    a[2] = hotArgs2
     a[3] = cachedToken
+    a[4] = cachedScale
+    a[5] = cachedCframe
+    a[6] = cachedScreen
+    a[7] = cachedAim
+    a[8] = false
 
-    -- Unrolled batch: 4 at a time in the hot inner loop reduces loop
-    -- overhead and lets Luau pipeline 4 fireMethod calls back-to-back.
+    local r1, r2, r3, r4, r5, r6, r7, r8 = a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]
+
     local i = 0
     while i + 4 <= count do
-        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
-        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
-        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
-        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
+        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
+        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
+        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
         i = i + 4
     end
     while i < count do
-        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
         i = i + 1
     end
 end
 
--- Global refresh: when hot remote changes (rare), invalidate arg cache.
-local function invalidateArgCache()
-    spamState.argCache = nil
+local refreshLoopConn = nil
+local function ensureHot()
+    if hotRemote and fireMethod then
+        if refreshLoopConn then
+            refreshLoopConn:Disconnect()
+            refreshLoopConn = nil
+        end
+        return
+    end
+    if next(remotesHook.captured) ~= nil then
+        refreshHot()
+    end
+    if hotRemote and fireMethod and refreshLoopConn then
+        refreshLoopConn:Disconnect()
+        refreshLoopConn = nil
+    end
 end
+
+refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
 
 RunService.PreSimulation:Connect(doSpamTick)
 RunService.Heartbeat:Connect(doSpamTick)
@@ -1191,6 +1231,14 @@ spamToggle = makeToggleRow(104, "Manual spam", function(s)
     spamState.enabled = s
     spamState.accumulator = 0
     spamState.lastFrame = os.clock()
+    if s then
+        if next(remotesHook.captured) ~= nil then
+            refreshHot()
+        end
+        if not refreshLoopConn then
+            refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
+        end
+    end
 end, { table = keybinds, name = "spam" })
 
 makeToggleRow(156, "Unlimited KBPS", function(s)
@@ -1489,6 +1537,7 @@ MiniButton.MouseButton2Click:Connect(function()
     spamState.enabled = false
     triggerEnabled = false
     if renderTickConn then renderTickConn:Disconnect() end
+    if refreshLoopConn then refreshLoopConn:Disconnect() end
     if noRender.enabled then disableNoRender() end
     ScreenGui:Destroy()
 end)
