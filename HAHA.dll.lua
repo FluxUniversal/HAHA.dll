@@ -35,6 +35,11 @@ local S = {
     armingBox = nil,
     armingKey = nil,
     unlimitedKbps = false,
+    raknet = nil,
+    raknetAvailable = false,
+    raknetQueue = {},
+    raknetQueueLimit = 512,
+    lastRaknetFlush = 0,
     infiniteMode = false,
     alive = true,
     hotRemote = nil,
@@ -66,7 +71,6 @@ local S = {
     lastAccuracyCalc = 0,
     aliveFolderCache = nil,
     aliveFolderCacheAt = 0,
-    renderTickConn = nil,
     refreshLoopConn = nil,
     triggerEnabled = false,
     infiniteBurst = 40,
@@ -84,13 +88,26 @@ local S = {
     statusVelocity = nil,
     statusPing = nil,
     statusAcc = nil,
+    statusNet = nil,
     accuracySlider = nil,
     spamToggle = nil,
     triggerToggle = nil,
     orbitToggle = nil,
     rageOrbitToggle = nil,
     infiniteToggle = nil,
+    unlimitedToggle = nil,
+    unlimitedWarn = nil,
 }
+
+do
+    S.raknet = rawget(getfenv(), "raknet") or rawget(getfenv(), "rnet") or (getgenv and getgenv().raknet) or (getgenv and getgenv().rnet)
+    if S.raknet then
+        if type(S.raknet.send) == "function" and type(S.raknet.get_network_schema) == "function" then
+            S.raknetAvailable = true
+            S.schema = S.raknet.get_network_schema()
+        end
+    end
+end
 
 local function keyName(k)
     if not k then return "None" end
@@ -152,10 +169,6 @@ local function getLocalHRP()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
-local function getOrbitHRP()
-    return getLocalHRP()
-end
-
 local function getOrbitBall()
     local now = os.clock()
     if not S.orbBallsCache or now - S.orbBallsCacheAt > 0.1 then
@@ -164,7 +177,7 @@ local function getOrbitBall()
     end
     local folder = S.orbBallsCache
     if not folder then return nil end
-    local hrp = getOrbitHRP()
+    local hrp = getLocalHRP()
     if not hrp then return nil end
     local pos = hrp.Position
     local closest, dist = nil, math.huge
@@ -182,7 +195,7 @@ end
 
 local function updateOrbit(dt)
     if not S.orbit.enabled then return end
-    local hrp = getOrbitHRP()
+    local hrp = getLocalHRP()
     if not hrp then return end
     local ball = getOrbitBall()
     if not ball then return end
@@ -862,6 +875,82 @@ local function refreshGuard()
     S.spamState.maxGuard = math.max(20, math.floor(S.spamState.rate * base * 2))
 end
 
+local function queueRaknetFire(remote)
+    if not S.raknetAvailable or not S.unlimitedKbps then return false end
+    local q = S.raknetQueue
+    if #q >= S.raknetQueueLimit then return false end
+    q[#q + 1] = remote
+    return true
+end
+
+local function flushRaknetQueue()
+    if not S.raknetAvailable or not S.unlimitedKbps then return end
+    local q = S.raknetQueue
+    if #q == 0 then return end
+    local now = os.clock()
+    if now - S.lastRaknetFlush < 0.004 then return end
+    S.lastRaknetFlush = now
+
+    refreshCachedToken()
+    refreshPayload()
+
+    local rn = S.raknet
+    local schema = S.schema
+    local tok = S.cachedToken
+    local sc = S.cachedScale
+    local cf = S.cachedCframe
+    local scr = S.cachedScreen
+    local aim = S.cachedAim
+    local a1 = S.hotArgs1
+    local a2 = S.hotArgs2
+
+    local maxPerFlush = 32
+    local sent = 0
+    local i = 1
+    while i <= #q and sent < maxPerFlush do
+        local remote = q[i]
+        i = i + 1
+        sent = sent + 1
+
+        local okSend = false
+        if schema and schema.Fire then
+            local okFire, packet = pcall(function()
+                return schema:Fire(remote, a1, a2, tok, sc, cf, scr, aim, false)
+            end)
+            if okFire and packet then
+                okSend = pcall(rn.send, packet)
+            end
+        elseif schema and schema.Encode then
+            local okFire, packet = pcall(function()
+                return schema:Encode(remote, {a1, a2, tok, sc, cf, scr, aim, false})
+            end)
+            if okFire and packet then
+                okSend = pcall(rn.send, packet)
+            end
+        end
+
+        if not okSend then
+            S.unlimitedKbps = false
+            if S.unlimitedToggle then S.unlimitedToggle.set(false) end
+            if S.unlimitedWarn then
+                S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
+                S.unlimitedWarn.Text = "RAKNET ENCODE FAILED"
+            end
+            break
+        end
+    end
+
+    if i > 1 then
+        local newQ = {}
+        local n = 0
+        for j = i, #q do
+            n = n + 1
+            newQ[n] = q[j]
+        end
+        S.raknetQueue = newQ
+    end
+end
+
 local arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
 
 local function refreshSpamArgs()
@@ -877,6 +966,14 @@ end
 
 local function fireBurst(remote, fn, count)
     local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
+    if S.unlimitedKbps and S.raknetAvailable then
+        local i = 0
+        while i < count do
+            if not queueRaknetFire(remote) then break end
+            i = i + 1
+        end
+        return
+    end
     local i = 0
     while i + 8 <= count do
         fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
@@ -965,19 +1062,39 @@ end
 S.refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
 RunService.PreSimulation:Connect(doSpamTick)
 RunService.Heartbeat:Connect(doSpamTick)
+RunService.RenderStepped:Connect(function()
+    flushRaknetQueue()
+end)
 
 local function setUnlimitedKbps(enabled)
+    if enabled and not S.raknetAvailable then
+        S.unlimitedKbps = false
+        if S.unlimitedToggle then S.unlimitedToggle.set(false) end
+        if S.unlimitedWarn then
+            S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
+            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (not detected)"
+        end
+        return
+    end
     S.unlimitedKbps = enabled
     S.screenRefreshThreshold = enabled and 1.0 or 0.016
-    S.payloadRefreshThreshold = 0.016
+    S.payloadRefreshThreshold = enabled and 0.05 or 0.016
     refreshGuard()
     S.spamState.accumulator = 0
     S.spamState.lastFrame = os.clock()
-    if enabled and not S.renderTickConn then
-        S.renderTickConn = RunService.RenderStepped:Connect(doSpamTick)
-    elseif not enabled and S.renderTickConn then
-        S.renderTickConn:Disconnect()
-        S.renderTickConn = nil
+    if enabled then
+        S.raknetQueue = {}
+        S.lastRaknetFlush = 0
+        if S.unlimitedWarn then
+            S.unlimitedWarn.TextColor3 = Color3.fromRGB(245, 190, 100)
+            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (active)"
+        end
+    else
+        S.raknetQueue = {}
+        if S.unlimitedWarn then
+            S.unlimitedWarn.TextColor3 = Color3.fromRGB(150, 150, 160)
+            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY"
+        end
     end
 end
 
@@ -1203,7 +1320,7 @@ local versionTag = Instance.new("TextLabel")
 versionTag.Size = UDim2.new(1, -24, 0, 16)
 versionTag.Position = UDim2.new(0, 12, 1, -28)
 versionTag.BackgroundTransparency = 1
-versionTag.Text = "v2.1.1"
+versionTag.Text = "v2.2.1"
 versionTag.TextColor3 = Theme.textMuted
 versionTag.Font = Enum.Font.Gotham
 versionTag.TextSize = 9
@@ -1417,7 +1534,7 @@ local function makeToggle(parent, label, onChanged, keybindTarget)
         if not state then tween(row, { BackgroundColor3 = Theme.card }, 0.12) end
     end)
 
-    return { set = setState, get = function() return state end }
+    return { set = setState, get = function() return state end, row = row }
 end
 
 local function makeSlider(parent, label, min, max, initial, onChanged)
@@ -1627,7 +1744,8 @@ local function makeTab(name, subtitle, order)
             tab.page.Visible = false
             tab.accent.BackgroundTransparency = 1
             tab.label.TextColor3 = Theme.textDim
-            tab.button.BackgroundTransparency = 1        end
+            tab.button.BackgroundTransparency = 1
+        end
         pages[name].page.Visible = true
         pages[name].accent.BackgroundTransparency = 0
         pages[name].label.TextColor3 = Theme.text
@@ -1696,7 +1814,6 @@ S.rageOrbitToggle = makeToggle(movementTab.inner, "Rage Orbit", function(s)
     end
 end)
 
-makeToggle(perfTab.inner, "Unlimited KBPS", function(s) setUnlimitedKbps(s) end)
 makeToggle(perfTab.inner, "No Render", function(s)
     if s then enableNoRender() else disableNoRender() end
 end)
@@ -1710,6 +1827,25 @@ S.infiniteToggle = makeToggle(perfTab.inner, "Infinite spam", function(s)
     end
 end)
 
+S.unlimitedToggle = makeToggle(perfTab.inner, "Unlimited KBPS", function(s)
+    setUnlimitedKbps(s)
+end)
+S.unlimitedWarn = Instance.new("TextLabel")
+S.unlimitedWarn.Size = UDim2.new(1, -8, 0, 16)
+S.unlimitedWarn.BackgroundTransparency = 1
+S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY"
+S.unlimitedWarn.TextColor3 = S.raknetAvailable and Theme.textMuted or Theme.danger
+S.unlimitedWarn.Font = Enum.Font.GothamBold
+S.unlimitedWarn.TextSize = 10
+S.unlimitedWarn.TextXAlignment = Enum.TextXAlignment.Center
+S.unlimitedWarn.ZIndex = 6
+S.unlimitedWarn.LayoutOrder = S.unlimitedToggle.row.LayoutOrder + 1
+S.unlimitedWarn.Parent = perfTab.inner
+if not S.raknetAvailable then
+    S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (not detected)"
+    S.unlimitedWarn.TextColor3 = Theme.danger
+end
+
 makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 1000, S.spamState.rate, function(v)
     S.spamState.rate = v
     refreshGuard()
@@ -1721,7 +1857,7 @@ makeToggle(tuningTab.inner, "Auto accuracy", function(s)
 end)
 
 local StatsCard = Instance.new("Frame")
-StatsCard.Size = UDim2.new(1, -8, 0, 110)
+StatsCard.Size = UDim2.new(1, -8, 0, 138)
 StatsCard.BackgroundColor3 = Theme.card
 StatsCard.BorderSizePixel = 0
 StatsCard.ZIndex = 5
@@ -1773,6 +1909,7 @@ end
 S.statusVelocity = makeStatRow(12, "Ball velocity")
 S.statusPing = makeStatRow(44, "Ping")
 S.statusAcc = makeStatRow(76, "Effective accuracy")
+S.statusNet = makeStatRow(108, "Network path")
 
 currentTab = "Combat"
 pages["Combat"].page.Visible = true
@@ -2104,6 +2241,18 @@ task.spawn(function()
             if S.statusAcc.Text ~= "manual" then S.statusAcc.Text = "manual" end
             S.accuracySlider.sub.Text = "manual"
         end
+        local netText
+        if S.unlimitedKbps and S.raknetAvailable then
+            netText = string.format("RAKNET (%d q)", #S.raknetQueue)
+            S.statusNet.TextColor3 = Theme.accent
+        elseif S.raknetAvailable then
+            netText = "Roblox (raknet ready)"
+            S.statusNet.TextColor3 = Theme.textMuted
+        else
+            netText = "Roblox (no raknet)"
+            S.statusNet.TextColor3 = Theme.textDim
+        end
+        if S.statusNet.Text ~= netText then S.statusNet.Text = netText end
         task.wait(0.05)
     end
 end)
@@ -2198,7 +2347,7 @@ MiniButton.MouseButton2Click:Connect(function()
     S.orbit.enabled = false
     S.rageOrbit.enabled = false
     S.infiniteMode = false
-    if S.renderTickConn then S.renderTickConn:Disconnect() end
+    S.unlimitedKbps = false
     if S.refreshLoopConn then S.refreshLoopConn:Disconnect() end
     if S.noRender.enabled then disableNoRender() end
     ScreenGui:Destroy()
