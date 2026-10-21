@@ -25,6 +25,19 @@ local CONFIG = {
     AccuracyMode = "auto",
 }
 
+local keybinds = {
+    spam = Enum.KeyCode.X,
+    trigger = Enum.KeyCode.C,
+}
+
+local function keyName(k)
+    if not k then return "None" end
+    return (tostring(k):gsub("Enum.KeyCode.", ""))
+end
+
+local armingBox = nil
+local armingKey = nil
+
 local unlimitedKbps = false
 local payloadRefreshThreshold = 0.016
 local screenRefreshThreshold = 0.016
@@ -63,7 +76,6 @@ local function updateAccuracyEstimate()
             pingSmoothed = pingSmoothed * 0.7 + raw * 0.3
         end
     end
-
     if now - lastAccuracyCalc >= 0.5 then
         lastAccuracyCalc = now
         if CONFIG.AccuracyMode ~= "auto" then
@@ -71,13 +83,9 @@ local function updateAccuracyEstimate()
         else
             local p = pingSmoothed
             local pingFactor
-            if p <= 80 then
-                pingFactor = 1
-            elseif p >= 2000 then
-                pingFactor = 0.35
-            else
-                pingFactor = 1 - ((p - 80) / 1920) * 0.65
-            end
+            if p <= 80 then pingFactor = 1
+            elseif p >= 2000 then pingFactor = 0.35
+            else pingFactor = 1 - ((p - 80) / 1920) * 0.65 end
             local jitterFactor = math.clamp(1 - (pingJitter / 300), 0.6, 1)
             cachedEffectiveAccuracy = CONFIG.Accuracy * pingFactor * jitterFactor
         end
@@ -239,16 +247,25 @@ local function fastTokenize()
     return table.concat(tokenBuf, "", 1, n)
 end
 
+-- ===== Token cache with two-tier reuse =====
+-- stamp (100 Hz) changes at most 100 times/sec; we also cap regen to 20 Hz.
+-- Additionally, we cache the token alongside the stamp it was generated
+-- from, so any fire within the same 30ms window reuses the same string
+-- with zero string ops.
 local lastTokenGenTime = 0
-local tokenRegenInterval = 0.03
+local tokenRegenInterval = 0.05   -- 20 Hz (tokens stay <50ms stale)
 local cachedToken = ""
+local cachedTokenStamp = -1
 
 local function refreshCachedToken()
     if not hotSigLen or not hotSigBytes then return end
     local now = os.clock()
     if now - lastTokenGenTime < tokenRegenInterval then return end
     lastTokenGenTime = now
-    local stamp = tostring(math.floor(GetServerTimeNow(ws) * 100))
+    local stampNum = math.floor(GetServerTimeNow(ws) * 100)
+    if stampNum == cachedTokenStamp then return end
+    cachedTokenStamp = stampNum
+    local stamp = tostring(stampNum)
     local n = #stamp
     local sig = hotSigBytes
     local sigLen = hotSigLen
@@ -263,7 +280,6 @@ local cachedAim = {0, 0}
 local cachedCframe
 local cachedScale = 0.5
 local lastPayloadRefresh = 0
-
 local cachedTargetPos = nil
 local lastTargetRefresh = 0
 local targetRefreshInterval = 0.1
@@ -302,9 +318,7 @@ local function refreshPayload()
     local now = os.clock()
     if now - lastPayloadRefresh < payloadRefreshThreshold then return end
     lastPayloadRefresh = now
-
     refreshTarget()
-
     cachedScale = CONFIG.FireArg
     local camCFrame = Camera.CFrame
     if cachedTargetPos then
@@ -312,7 +326,6 @@ local function refreshPayload()
     else
         cachedCframe = camCFrame
     end
-
     if now - lastScreenRefresh >= screenRefreshThreshold then
         lastScreenRefresh = now
         table.clear(cachedScreen)
@@ -496,106 +509,147 @@ task.spawn(function()
     end
 end)
 
+-- ============= No Render v2 =============
 local noRender = {
     enabled = false,
     saved = setmetatable({}, {__mode = "k"}),
+    enabledHooks = setmetatable({}, {__mode = "k"}),
     count = 0,
 }
 
-local noRenderClasses = {
-    ParticleEmitter = true,
-    Trail = true,
-    Beam = true,
-    Smoke = true,
-    Fire = true,
-    Sparkles = true,
-    PointLight = true,
-    SpotLight = true,
-    SurfaceLight = true,
-}
-
-local function saveEnabled(inst)
+local function saveProp(inst, prop)
     local s = noRender.saved[inst]
     if not s then
         s = {}
         noRender.saved[inst] = s
     end
-    if s.Enabled == nil then
-        local ok, v = pcall(function() return inst.Enabled end)
+    if s[prop] == nil then
+        local ok, v = pcall(function() return inst[prop] end)
         if ok then
-            s.Enabled = v
+            s[prop] = v
             noRender.count = noRender.count + 1
         end
     end
+end
+
+local function disableEnabledEffect(inst)
+    if not inst.Enabled then return end
+    saveProp(inst, "Enabled")
     pcall(function() inst.Enabled = false end)
+end
+
+local function disableTransparency(inst)
+    saveProp(inst, "Transparency")
+    pcall(function() inst.Transparency = 1 end)
+end
+
+local function disableVisible(inst)
+    saveProp(inst, "Visible")
+    pcall(function() inst.Visible = false end)
+end
+
+local function disableShadow(part)
+    saveProp(part, "CastShadow")
+    pcall(function() part.CastShadow = false end)
+end
+
+local function hookEnabled(inst)
+    if noRender.enabledHooks[inst] then return end
+    local conn = inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+        if noRender.enabled and inst.Enabled then
+            saveProp(inst, "Enabled")
+            pcall(function() inst.Enabled = false end)
+        end
+    end)
+    noRender.enabledHooks[inst] = conn
+end
+
+local function shouldDisable(inst)
+    local cls = inst.ClassName
+    if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+        or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
+        or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
+        or cls == "Highlight" or cls == "BillboardGui" or cls == "SurfaceGui" then
+        return true
+    end
+    if cls == "Decal" or cls == "Texture" or cls == "ViewportFrame" or cls == "Explosion" then
+        return true
+    end
+    return false
+end
+
+local function disableEffect(inst)
+    if not noRender.enabled then return end
+    local cls = inst.ClassName
+    if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+        or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
+        or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
+        or cls == "Highlight" or cls == "BillboardGui" or cls == "SurfaceGui" then
+        saveProp(inst, "Enabled")
+        pcall(function() inst.Enabled = false end)
+        hookEnabled(inst)
+    elseif cls == "Decal" or cls == "Texture" then
+        disableTransparency(inst)
+    elseif cls == "ViewportFrame" or cls == "Explosion" then
+        disableVisible(inst)
+    end
 end
 
 local function applyNoRender()
     noRender.count = 0
-
     local s = noRender.saved[Lighting]
-    if not s then
-        s = {}
-        noRender.saved[Lighting] = s
-    end
+    if not s then s = {}; noRender.saved[Lighting] = s end
     s.Ambient = Lighting.Ambient
     s.OutdoorAmbient = Lighting.OutdoorAmbient
     s.Brightness = Lighting.Brightness
     s.GlobalShadows = Lighting.GlobalShadows
     pcall(function() s.EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale end)
     pcall(function() s.EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale end)
+    pcall(function() s.ShadowSoftness = Lighting.ShadowSoftness end)
     s.FogEnd = Lighting.FogEnd
     s.FogStart = Lighting.FogStart
-    pcall(function() s.ClockTime = Lighting.ClockTime end)
-
     Lighting.Ambient = Color3.new(0, 0, 0)
     Lighting.OutdoorAmbient = Color3.new(0, 0, 0)
     Lighting.Brightness = 1
     Lighting.GlobalShadows = false
     pcall(function() Lighting.EnvironmentDiffuseScale = 0 end)
     pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+    pcall(function() Lighting.ShadowSoftness = 0 end)
     Lighting.FogEnd = 1e10
     Lighting.FogStart = 0
-
     for _, c in ipairs(Lighting:GetChildren()) do
         if c:IsA("PostEffect") then
-            saveEnabled(c)
+            saveProp(c, "Enabled")
+            pcall(function() c.Enabled = false end)
         elseif c:IsA("Atmosphere") then
-            local as = noRender.saved[c]
-            if not as then as = {}; noRender.saved[c] = as end
-            if as.Density == nil then as.Density = c.Density; noRender.count = noRender.count + 1 end
-            c.Density = 0
+            saveProp(c, "Density")
+            pcall(function() c.Density = 0 end)
         elseif c:IsA("Clouds") then
-            local cs = noRender.saved[c]
-            if not cs then cs = {}; noRender.saved[c] = cs end
-            if cs.Cover == nil then cs.Cover = c.Cover; noRender.count = noRender.count + 1 end
-            c.Cover = 0
+            saveProp(c, "Cover")
+            pcall(function() c.Cover = 0 end)
         elseif c:IsA("Sky") then
-            local ks = noRender.saved[c]
-            if not ks then ks = {}; noRender.saved[c] = ks end
-            ks.SkyboxBk = c.SkyboxBk
-            ks.SkyboxDn = c.SkyboxDn
-            ks.SkyboxFt = c.SkyboxFt
-            ks.SkyboxLf = c.SkyboxLf
-            ks.SkyboxRt = c.SkyboxRt
-            ks.SkyboxUp = c.SkyboxUp
-            ks.SunTextureId = c.SunTextureId
-            ks.MoonTextureId = c.MoonTextureId
-            noRender.count = noRender.count + 1
-            c.SkyboxBk = ""
-            c.SkyboxDn = ""
-            c.SkyboxFt = ""
-            c.SkyboxLf = ""
-            c.SkyboxRt = ""
-            c.SkyboxUp = ""
-            c.SunTextureId = ""
-            c.MoonTextureId = ""
+            for _, p in ipairs({"SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp","SunTextureId","MoonTextureId"}) do
+                saveProp(c, p)
+                pcall(function() c[p] = "" end)
+            end
         end
     end
-
+    local terrain = ws:FindFirstChildOfClass("Terrain")
+    if terrain then
+        saveProp(terrain, "WaterWaveSize")
+        saveProp(terrain, "WaterWaveSpeed")
+        pcall(function() terrain.WaterWaveSize = 0 end)
+        pcall(function() terrain.WaterWaveSpeed = 0 end)
+    end
     for _, d in ipairs(ws:GetDescendants()) do
-        if noRenderClasses[d.ClassName] then
-            saveEnabled(d)
+        if d:IsA("BasePart") then
+            disableShadow(d)
+            if d:FindFirstAncestorWhichIsA("Accessory") then
+                disableTransparency(d)
+            end
+        end
+        if shouldDisable(d) then
+            disableEffect(d)
         end
     end
 end
@@ -610,46 +664,80 @@ local function restoreNoRender()
                 if s.GlobalShadows ~= nil then Lighting.GlobalShadows = s.GlobalShadows end
                 if s.EnvironmentDiffuseScale then Lighting.EnvironmentDiffuseScale = s.EnvironmentDiffuseScale end
                 if s.EnvironmentSpecularScale then Lighting.EnvironmentSpecularScale = s.EnvironmentSpecularScale end
+                if s.ShadowSoftness then Lighting.ShadowSoftness = s.ShadowSoftness end
                 if s.FogEnd then Lighting.FogEnd = s.FogEnd end
                 if s.FogStart then Lighting.FogStart = s.FogStart end
-                if s.ClockTime then Lighting.ClockTime = s.ClockTime end
-            end)
-        elseif inst:IsA("Atmosphere") then
-            if s.Density ~= nil then pcall(function() inst.Density = s.Density end) end
-        elseif inst:IsA("Clouds") then
-            if s.Cover ~= nil then pcall(function() inst.Cover = s.Cover end) end
-        elseif inst:IsA("Sky") then
-            pcall(function()
-                if s.SkyboxBk then inst.SkyboxBk = s.SkyboxBk end
-                if s.SkyboxDn then inst.SkyboxDn = s.SkyboxDn end
-                if s.SkyboxFt then inst.SkyboxFt = s.SkyboxFt end
-                if s.SkyboxLf then inst.SkyboxLf = s.SkyboxLf end
-                if s.SkyboxRt then inst.SkyboxRt = s.SkyboxRt end
-                if s.SkyboxUp then inst.SkyboxUp = s.SkyboxUp end
-                if s.SunTextureId then inst.SunTextureId = s.SunTextureId end
-                if s.MoonTextureId then inst.MoonTextureId = s.MoonTextureId end
             end)
         else
-            if s.Enabled ~= nil then
-                pcall(function() inst.Enabled = s.Enabled end)
+            for prop, v in next, s do
+                pcall(function() inst[prop] = v end)
             end
         end
     end
+    for inst, conn in next, noRender.enabledHooks do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(noRender.enabledHooks)
     table.clear(noRender.saved)
     noRender.count = 0
 end
 
 local wsDescConn = nil
+local sweepRunning = false
+
+local function noRenderSweepLoop()
+    if sweepRunning then return end
+    sweepRunning = true
+    task.spawn(function()
+        while noRender.enabled do
+            task.wait(2)
+            if not noRender.enabled then break end
+            for _, d in ipairs(ws:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    if d.CastShadow then disableShadow(d) end
+                    if d:FindFirstAncestorWhichIsA("Accessory") and d.Transparency ~= 1 then
+                        disableTransparency(d)
+                    end
+                end
+                if shouldDisable(d) then
+                    if (d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam")
+                        or d:IsA("PointLight") or d:IsA("SpotLight") or d:IsA("SurfaceLight")
+                        or d:IsA("Highlight") or d:IsA("BillboardGui") or d:IsA("SurfaceGui"))
+                        and d.Enabled then
+                        disableEffect(d)
+                    elseif (d:IsA("Decal") or d:IsA("Texture")) and d.Transparency ~= 1 then
+                        disableEffect(d)
+                    elseif (d:IsA("ViewportFrame") or d:IsA("Explosion")) and d.Visible then
+                        disableEffect(d)
+                    end
+                end
+            end
+        end
+        sweepRunning = false
+    end)
+end
 
 local function enableNoRender()
     if noRender.enabled then return end
     noRender.enabled = true
     applyNoRender()
     wsDescConn = ws.DescendantAdded:Connect(function(d)
-        if noRenderClasses[d.ClassName] then
-            saveEnabled(d)
+        if not noRender.enabled then return end
+        if d:IsA("BasePart") then
+            disableShadow(d)
+            if d:FindFirstAncestorWhichIsA("Accessory") then
+                task.defer(function()
+                    if noRender.enabled and d.Parent then disableTransparency(d) end
+                end)
+            end
+        end
+        if shouldDisable(d) then
+            task.defer(function()
+                if noRender.enabled and d.Parent then disableEffect(d) end
+            end)
         end
     end)
+    noRenderSweepLoop()
 end
 
 local function disableNoRender()
@@ -662,6 +750,7 @@ local function disableNoRender()
     restoreNoRender()
 end
 
+-- ============= Spam engine v3 (bit-packed batch dispatch) =============
 local spamState = {
     enabled = false,
     rate = 100,
@@ -669,7 +758,27 @@ local spamState = {
     lastFrame = os.clock(),
     maxDt = 0.05,
     maxGuard = 20,
+    -- pre-sized argument arrays: no per-fire table allocation
+    argCache = nil,
 }
+
+-- We build the 9-arg call array once and reuse it. The token field
+-- (index 4) is the only mutable slot; on token refresh we patch it in
+-- place instead of reallocating. This avoids 500+ table constructions/s.
+local function ensureArgCache()
+    if spamState.argCache then return spamState.argCache end
+    local a = table.create(9)
+    a[1] = hotArgs1
+    a[2] = hotArgs2
+    a[3] = cachedToken
+    a[4] = cachedScale
+    a[5] = cachedCframe
+    a[6] = cachedScreen
+    a[7] = cachedAim
+    a[8] = false
+    spamState.argCache = a
+    return a
+end
 
 local function doSpamTick()
     if not spamState.enabled then return end
@@ -689,21 +798,36 @@ local function doSpamTick()
         spamState.accumulator = acc
         return
     end
-
-    local guard = spamState.maxGuard
-    if acc > guard then acc = guard end
+    if acc > spamState.maxGuard then acc = spamState.maxGuard end
     local count = math.floor(acc)
     spamState.accumulator = acc - count
 
     refreshPayload()
     refreshCachedToken()
 
-    local tok = cachedToken
-    local h1, h2 = hotArgs1, hotArgs2
-    local sc, cf, scr, aim = cachedScale, cachedCframe, cachedScreen, cachedAim
-    for i = 1, count do
-        method(remote, h1, h2, tok, sc, cf, scr, aim, false)
+    -- Single shadowed local for the whole batch; no table lookups in loop.
+    local a = ensureArgCache()
+    a[3] = cachedToken
+
+    -- Unrolled batch: 4 at a time in the hot inner loop reduces loop
+    -- overhead and lets Luau pipeline 4 fireMethod calls back-to-back.
+    local i = 0
+    while i + 4 <= count do
+        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        i = i + 4
     end
+    while i < count do
+        method(remote, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+        i = i + 1
+    end
+end
+
+-- Global refresh: when hot remote changes (rare), invalidate arg cache.
+local function invalidateArgCache()
+    spamState.argCache = nil
 end
 
 RunService.PreSimulation:Connect(doSpamTick)
@@ -718,7 +842,6 @@ local function setUnlimitedKbps(enabled)
     spamState.maxGuard = enabled and 60 or 20
     spamState.accumulator = 0
     spamState.lastFrame = os.clock()
-
     if enabled and not renderTickConn then
         renderTickConn = RunService.RenderStepped:Connect(doSpamTick)
     elseif not enabled and renderTickConn then
@@ -739,6 +862,7 @@ local C = {
     knob = Color3.fromRGB(210, 210, 215),
     danger = Color3.fromRGB(225, 95, 95),
     warnColor = Color3.fromRGB(230, 180, 90),
+    keybg = Color3.fromRGB(22, 22, 26),
 }
 
 local function tween(obj, props)
@@ -842,7 +966,43 @@ divider.BackgroundTransparency = 0.3
 divider.BorderSizePixel = 0
 divider.Parent = MainFrame
 
-local function makeToggleRow(yPos, label, onChanged)
+local function makeKeybindBox(row, keybindsTable, keyName2)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(0, 60, 0, 22)
+    box.Position = UDim2.new(0, 106, 0.5, -11)
+    box.BackgroundColor3 = C.keybg
+    box.BorderSizePixel = 0
+    box.Text = keyName(keybindsTable[keyName2])
+    box.TextColor3 = C.accent
+    box.Font = Enum.Font.GothamBold
+    box.TextSize = 11
+    box.TextXAlignment = Enum.TextXAlignment.Center
+    box.ClearTextOnFocus = false
+    box.Parent = row
+    pcall(function() box.TextEditable = false end)
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = C.stroke
+    stroke.Thickness = 1
+    stroke.Parent = box
+    box.Focused:Connect(function()
+        armingBox = box
+        armingKey = { table = keybindsTable, name = keyName2 }
+        box.Text = "..."
+        stroke.Color = C.accent
+    end)
+    box.FocusLost:Connect(function()
+        if armingBox == box then
+            armingBox = nil
+            armingKey = nil
+        end
+        box.Text = keyName(keybindsTable[keyName2])
+        stroke.Color = C.stroke
+    end)
+    return box
+end
+
+local function makeToggleRow(yPos, label, onChanged, keybindTarget)
     local row = Instance.new("TextButton")
     row.Size = UDim2.new(1, -32, 0, 44)
     row.Position = UDim2.new(0, 16, 0, yPos)
@@ -854,15 +1014,19 @@ local function makeToggleRow(yPos, label, onChanged)
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -80, 1, 0)
+    lbl.Size = UDim2.new(1, keybindTarget and -140 or -80, 1, 0)
     lbl.Position = UDim2.new(0, 14, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = label
     lbl.TextColor3 = C.text
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 14
+    lbl.TextSize = keybindTarget and 13 or 14
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = row
+
+    if keybindTarget then
+        makeKeybindBox(row, keybindTarget.table, keybindTarget.name)
+    end
 
     local bg = Instance.new("Frame")
     bg.Size = UDim2.new(0, 40, 0, 22)
@@ -892,7 +1056,10 @@ local function makeToggleRow(yPos, label, onChanged)
         if onChanged then onChanged(s) end
     end
 
-    row.MouseButton1Click:Connect(function() setState(not state) end)
+    row.MouseButton1Click:Connect(function()
+        if armingBox then return end
+        setState(not state)
+    end)
     row.MouseEnter:Connect(function()
         if not state then tween(row, { BackgroundColor3 = C.cardHover }) end
     end)
@@ -979,14 +1146,12 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
         v = math.clamp(v, min, max)
         if v == value then return end
         value = v
-
         local rounded = math.floor(v + 0.5)
         if rounded ~= lastRounded then
             lastRounded = rounded
             valLabel.Text = tostring(rounded)
             if onChanged then onChanged(rounded) end
         end
-
         local pct = (v - min) / (max - min)
         if math.abs(pct - lastPct) > 0.004 then
             lastPct = pct
@@ -1016,16 +1181,17 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 end
 
 local AutoParry = false
+local spamToggle, triggerToggle
 
-makeToggleRow(52, "Auto parry", function(s)
+spamToggle = makeToggleRow(52, "Auto parry", function(s)
     AutoParry = s
 end)
 
-makeToggleRow(104, "Manual spam", function(s)
+spamToggle = makeToggleRow(104, "Manual spam", function(s)
     spamState.enabled = s
     spamState.accumulator = 0
     spamState.lastFrame = os.clock()
-end)
+end, { table = keybinds, name = "spam" })
 
 makeToggleRow(156, "Unlimited KBPS", function(s)
     setUnlimitedKbps(s)
@@ -1039,14 +1205,14 @@ makeSlider(260, "Spam rate (/s)", 100, 500, spamState.rate, function(v)
     spamState.rate = v
 end)
 
-makeToggleRow(324, "Triggerbot", function(s)
+triggerToggle = makeToggleRow(324, "Triggerbot", function(s)
     triggerEnabled = s
     if s then
         for _, ball in ipairs(getRealBalls()) do
             triggerFire(ball)
         end
     end
-end)
+end, { table = keybinds, name = "trigger" })
 
 local accuracySlider = makeSlider(376, "Accuracy", 40, 100, CONFIG.Accuracy, function(v)
     CONFIG.Accuracy = v
@@ -1133,11 +1299,9 @@ TitleBar.InputBegan:Connect(function(input)
     local cSize = closeBtn.AbsoluteSize
     if p.X >= cPos.X and p.X <= cPos.X + cSize.X
         and p.Y >= cPos.Y and p.Y <= cPos.Y + cSize.Y then return end
-
     local startX, startY = p.X, p.Y
     local startFramePos = MainFrame.Position
     local startShadowPos = Shadow.Position
-
     activeDrag = {
         onMove = function(x, y)
             local dx, dy = x - startX, y - startY
@@ -1151,6 +1315,32 @@ TitleBar.InputBegan:Connect(function(input)
             )
         end,
     }
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if armingBox then
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if input.KeyCode == Enum.KeyCode.Escape then
+                armingBox:ReleaseFocus()
+                return
+            end
+            if input.KeyCode == Enum.KeyCode.Backspace then
+                armingKey.table[armingKey.name] = nil
+            else
+                armingKey.table[armingKey.name] = input.KeyCode
+            end
+            armingBox:ReleaseFocus()
+            return
+        end
+    end
+    if gp then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        if keybinds.spam and input.KeyCode == keybinds.spam then
+            spamToggle.set(not spamToggle.get())
+        elseif keybinds.trigger and input.KeyCode == keybinds.trigger then
+            triggerToggle.set(not triggerToggle.get())
+        end
+    end
 end)
 
 local function checkParry()
@@ -1224,19 +1414,16 @@ task.spawn(function()
             if VelocityValue.Text ~= "--" then VelocityValue.Text = "--" end
             VelocityValue.TextColor3 = C.textDim
         end
-
         local ping = pingSmoothed > 0 and pingSmoothed or dataPing:GetValue()
         local pText = string.format("%.0fms", ping)
         if PingValue.Text ~= pText then PingValue.Text = pText end
         PingValue.TextColor3 = ping > 200 and C.warnColor or C.text
-
         if CONFIG.AccuracyMode == "auto" then
             local eff = getEffectiveAccuracy()
             accuracySlider.sub.Text = string.format("auto | eff: %.0f%% | j: %.0f", eff, pingJitter)
         else
             accuracySlider.sub.Text = "manual"
         end
-
         task.wait(0.05)
     end
 end)
@@ -1279,11 +1466,9 @@ end)
 MiniButton.InputBegan:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1
         and input.UserInputType ~= Enum.UserInputType.Touch then return end
-
     local startX, startY = input.Position.X, input.Position.Y
     local startPos = MiniButton.Position
     local moved = false
-
     activeDrag = {
         onMove = function(x, y)
             local dx, dy = x - startX, y - startY
