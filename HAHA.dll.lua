@@ -24,6 +24,9 @@ local CONFIG = {
     AccuracyMode = "auto",
 }
 
+local unlimitedKbps = false
+local payloadRefreshThreshold = 0.016
+
 local remotesHook = {
     mt = {}, orig = {}, captured = {}, tokenFn = nil, firstSignal = nil,
 }
@@ -129,6 +132,7 @@ do
 end
 
 local hotRemote, hotArgs1, hotArgs2, hotIsEvent
+local fireMethod
 local hotSigBytes, hotSigLen
 
 local function cacheSignature()
@@ -149,6 +153,7 @@ local function refreshHot()
         hotArgs1 = args[1]
         hotArgs2 = args[2]
         hotIsEvent = remote:IsA("RemoteEvent")
+        fireMethod = hotIsEvent and remote.FireServer or remote.InvokeServer
         cacheSignature()
         return
     end
@@ -165,6 +170,24 @@ local function fastTokenize()
         tokenBuf[i] = string.char(bit32.bxor((string.byte(stamp, i) + i) % 256, sig[(i - 1) % sigLen + 1]))
     end
     return table.concat(tokenBuf, "", 1, n)
+end
+
+local lastTokenStamp = -1
+local cachedToken = ""
+
+local function refreshCachedToken()
+    if not hotSigLen or not hotSigBytes then return end
+    local stamp = math.floor(GetServerTimeNow(ws) * 100)
+    if stamp == lastTokenStamp then return end
+    lastTokenStamp = stamp
+    local stampStr = tostring(stamp)
+    local n = #stampStr
+    local sig = hotSigBytes
+    local sigLen = hotSigLen
+    for i = 1, n do
+        tokenBuf[i] = string.char(bit32.bxor((string.byte(stampStr, i) + i) % 256, sig[(i - 1) % sigLen + 1]))
+    end
+    cachedToken = table.concat(tokenBuf, "", 1, n)
 end
 
 local cachedScreen = {}
@@ -195,7 +218,7 @@ end
 
 local function refreshPayload()
     local now = os.clock()
-    if now - lastPayloadRefresh < 0.016 then return end
+    if now - lastPayloadRefresh < payloadRefreshThreshold then return end
     lastPayloadRefresh = now
     cachedScale = CONFIG.FireArg
     local target = getTarget()
@@ -394,37 +417,52 @@ end)
 
 local spamState = {
     enabled = false,
-    interval = 0.022,
+    rate = 100,
+    interval = 1 / 100,
     accumulator = 0,
     lastFrame = os.clock(),
-    maxPerFrame = 2,
+    maxDt = 0.05,
+    maxGuard = 30,
 }
 
-RunService.PreSimulation:Connect(function()
-    refreshPayload()
-
+local function doSpamTick()
     if not spamState.enabled then return end
-    if not hotRemote then return end
+    local remote = hotRemote
+    if not remote then return end
+    local method = fireMethod
+    if not method then return end
 
     local now = os.clock()
     local dt = now - spamState.lastFrame
     spamState.lastFrame = now
-    if dt > 0.08 then dt = 0 end
-    spamState.accumulator = spamState.accumulator + dt
+    if dt > spamState.maxDt then dt = spamState.maxDt end
 
-    local fired = 0
-    while spamState.accumulator >= spamState.interval and fired < spamState.maxPerFrame do
-        spamState.accumulator = spamState.accumulator - spamState.interval
-        local tok = fastTokenize()
-        if hotIsEvent then
-            hotRemote:FireServer(hotArgs1, hotArgs2, tok, cachedScale, cachedCframe, cachedScreen, cachedAim, false)
-        else
-            hotRemote:InvokeServer(hotArgs1, hotArgs2, tok, cachedScale, cachedCframe, cachedScreen, cachedAim, false)
-        end
-        fired = fired + 1
+    local acc = spamState.accumulator + dt
+    if acc < spamState.interval then
+        spamState.accumulator = acc
+        return
     end
-    if fired >= spamState.maxPerFrame then
-        spamState.accumulator = math.min(spamState.accumulator, spamState.interval * 0.5)
+
+    local count = math.floor(acc / spamState.interval)
+    if count > spamState.maxGuard then count = spamState.maxGuard end
+    spamState.accumulator = acc - count * spamState.interval
+
+    refreshPayload()
+    refreshCachedToken()
+
+    local tok = cachedToken
+    local h1, h2 = hotArgs1, hotArgs2
+    local sc, cf, scr, aim = cachedScale, cachedCframe, cachedScreen, cachedAim
+    for i = 1, count do
+        method(remote, h1, h2, tok, sc, cf, scr, aim, false)
+    end
+end
+
+RunService.PreSimulation:Connect(doSpamTick)
+
+RunService.Heartbeat:Connect(function()
+    if unlimitedKbps then
+        doSpamTick()
     end
 end)
 
@@ -446,6 +484,27 @@ local function tween(obj, props)
     TweenService:Create(obj, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 end
 
+local activeDrag = nil
+
+UserInputService.InputChanged:Connect(function(input)
+    local d = activeDrag
+    if not d then return end
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.Touch then
+        d.onMove(input.Position.X, input.Position.Y)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    local d = activeDrag
+    if not d then return end
+    local t = input.UserInputType
+    if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+        activeDrag = nil
+        if d.onEnd then d.onEnd() end
+    end
+end)
+
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "HAHA_dll"
 ScreenGui.ResetOnSpawn = false
@@ -454,8 +513,8 @@ ScreenGui.DisplayOrder = 999
 ScreenGui.Parent = PlayerGui
 
 local Shadow = Instance.new("Frame")
-Shadow.Size = UDim2.new(0, 264, 0, 420)
-Shadow.Position = UDim2.new(0.5, -132, 0.5, -210)
+Shadow.Size = UDim2.new(0, 264, 0, 512)
+Shadow.Position = UDim2.new(0.5, -132, 0.5, -256)
 Shadow.BackgroundColor3 = Color3.new(0, 0, 0)
 Shadow.BackgroundTransparency = 0.5
 Shadow.BorderSizePixel = 0
@@ -463,8 +522,8 @@ Shadow.Parent = ScreenGui
 Instance.new("UICorner", Shadow).CornerRadius = UDim.new(0, 14)
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 260, 0, 416)
-MainFrame.Position = UDim2.new(0.5, -130, 0.5, -208)
+MainFrame.Size = UDim2.new(0, 260, 0, 508)
+MainFrame.Position = UDim2.new(0.5, -130, 0.5, -254)
 MainFrame.BackgroundColor3 = C.bg
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
@@ -490,17 +549,9 @@ TitleBar.Size = UDim2.new(1, 0, 0, 40)
 TitleBar.BackgroundTransparency = 1
 TitleBar.Parent = MainFrame
 
-local statusDot = Instance.new("Frame")
-statusDot.Size = UDim2.new(0, 8, 0, 8)
-statusDot.Position = UDim2.new(0, 16, 0.5, -4)
-statusDot.BackgroundColor3 = remotesHook.tokenFn and C.accent or C.warnColor
-statusDot.BorderSizePixel = 0
-statusDot.Parent = TitleBar
-Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
-
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -80, 1, 0)
-title.Position = UDim2.new(0, 32, 0, 0)
+title.Position = UDim2.new(0, 16, 0, 0)
 title.BackgroundTransparency = 1
 title.Text = "HAHA.dll"
 title.TextColor3 = C.text
@@ -641,8 +692,9 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
     track.Parent = container
     Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
+    local initialPct = (initial - min) / (max - min)
     local fill = Instance.new("Frame")
-    fill.Size = UDim2.new((initial - min) / (max - min), 0, 1, 0)
+    fill.Size = UDim2.new(initialPct, 0, 1, 0)
     fill.BackgroundColor3 = C.accent
     fill.BorderSizePixel = 0
     fill.Parent = track
@@ -650,7 +702,7 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 
     local knob = Instance.new("Frame")
     knob.Size = UDim2.new(0, 14, 0, 14)
-    knob.Position = UDim2.new((initial - min) / (max - min), 0, 0.5, -7)
+    knob.Position = UDim2.new(initialPct, 0, 0.5, -7)
     knob.AnchorPoint = Vector2.new(0.5, 0)
     knob.BackgroundColor3 = C.knob
     knob.BorderSizePixel = 0
@@ -658,48 +710,48 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
     local value = initial
-    local dragging = false
+    local lastRounded = math.floor(initial + 0.5)
+    local lastPct = initialPct
+    local dragAbsX, dragSizeX
 
     local function setValue(v)
         v = math.clamp(v, min, max)
+        if v == value then return end
         value = v
+
+        local rounded = math.floor(v + 0.5)
+        if rounded ~= lastRounded then
+            lastRounded = rounded
+            valLabel.Text = tostring(rounded)
+            if onChanged then onChanged(rounded) end
+        end
+
         local pct = (v - min) / (max - min)
-        fill.Size = UDim2.new(pct, 0, 1, 0)
-        knob.Position = UDim2.new(pct, 0, 0.5, -7)
-        valLabel.Text = tostring(math.floor(v + 0.5))
-        if onChanged then onChanged(v) end
+        if math.abs(pct - lastPct) > 0.004 then
+            lastPct = pct
+            fill.Size = UDim2.new(pct, 0, 1, 0)
+            knob.Position = UDim2.new(pct, 0, 0.5, -7)
+        end
     end
 
     local function trackToValue(x)
-        local abs = track.AbsolutePosition.X
-        local size = track.AbsoluteSize.X
-        local pct = math.clamp((x - abs) / size, 0, 1)
+        if not dragSizeX or dragSizeX == 0 then return end
+        local pct = (x - dragAbsX) / dragSizeX
+        if pct < 0 then pct = 0 elseif pct > 1 then pct = 1 end
         setValue(min + pct * (max - min))
     end
 
     track.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
+            dragAbsX = track.AbsolutePosition.X
+            dragSizeX = track.AbsoluteSize.X
+            activeDrag = { onMove = function(x) trackToValue(x) end }
             trackToValue(input.Position.X)
         end
     end)
 
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
-            trackToValue(input.Position.X)
-        end
-    end)
-
-    UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-
-    return { set = setValue, get = function() return value end, sub = sub, val = valLabel }
+    return { set = setValue, get = function() return value end, sub = sub }
 end
 
 local AutoParry = false
@@ -709,7 +761,7 @@ local function getEffectiveAccuracy()
         return CONFIG.Accuracy
     end
     local ping = dataPing:GetValue()
-    
+
     if ping <= 80 then
         return CONFIG.Accuracy
     elseif ping >= 2580 then
@@ -736,7 +788,21 @@ makeToggleRow(104, "Manual spam", function(s)
     spamState.lastFrame = os.clock()
 end)
 
-makeToggleRow(156, "Triggerbot", function(s)
+makeToggleRow(156, "Unlimited KBPS", function(s)
+    unlimitedKbps = s
+    payloadRefreshThreshold = s and 0.15 or 0.016
+    spamState.maxDt = s and 0.15 or 0.05
+    spamState.maxGuard = s and 100 or 30
+    spamState.accumulator = 0
+    spamState.lastFrame = os.clock()
+end)
+
+makeSlider(208, "Spam rate (/s)", 100, 500, spamState.rate, function(v)
+    spamState.rate = v
+    spamState.interval = 1 / v
+end)
+
+makeToggleRow(272, "Triggerbot", function(s)
     triggerEnabled = s
     if s then
         for _, ball in ipairs(getRealBalls()) do
@@ -745,17 +811,17 @@ makeToggleRow(156, "Triggerbot", function(s)
     end
 end)
 
-local accuracySlider = makeSlider(208, "Accuracy", 40, 100, CONFIG.Accuracy, function(v)
-    CONFIG.Accuracy = math.floor(v + 0.5)
+local accuracySlider = makeSlider(324, "Accuracy", 40, 100, CONFIG.Accuracy, function(v)
+    CONFIG.Accuracy = v
 end)
 
-makeToggleRow(272, "Auto accuracy", function(s)
+makeToggleRow(388, "Auto accuracy", function(s)
     CONFIG.AccuracyMode = s and "auto" or "manual"
 end)
 
 local StatsCard = Instance.new("Frame")
 StatsCard.Size = UDim2.new(1, -32, 0, 56)
-StatsCard.Position = UDim2.new(0, 16, 0, 344)
+StatsCard.Position = UDim2.new(0, 16, 0, 440)
 StatsCard.BackgroundColor3 = C.card
 StatsCard.BorderSizePixel = 0
 StatsCard.Parent = MainFrame
@@ -821,9 +887,6 @@ closeBtn.MouseLeave:Connect(function()
     tween(closeBtn, { BackgroundColor3 = Color3.fromRGB(46, 46, 52), TextColor3 = C.textDim })
 end)
 
-local dragging = false
-local dragInput, dragStart, startPos, shadowStartPos
-
 TitleBar.InputBegan:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1
         and input.UserInputType ~= Enum.UserInputType.Touch then return end
@@ -832,34 +895,24 @@ TitleBar.InputBegan:Connect(function(input)
     local cSize = closeBtn.AbsoluteSize
     if p.X >= cPos.X and p.X <= cPos.X + cSize.X
         and p.Y >= cPos.Y and p.Y <= cPos.Y + cSize.Y then return end
-    dragging = true
-    dragStart = input.Position
-    startPos = MainFrame.Position
-    shadowStartPos = Shadow.Position
-    input.Changed:Connect(function()
-        if input.UserInputState == Enum.UserInputState.End then dragging = false end
-    end)
-end)
 
-TitleBar.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
-end)
+    local startX, startY = p.X, p.Y
+    local startFramePos = MainFrame.Position
+    local startShadowPos = Shadow.Position
 
-UserInputService.InputChanged:Connect(function(input)
-    if input == dragInput and dragging then
-        local delta = input.Position - dragStart
-        MainFrame.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y
-        )
-        Shadow.Position = UDim2.new(
-            shadowStartPos.X.Scale, shadowStartPos.X.Offset + delta.X,
-            shadowStartPos.Y.Scale, shadowStartPos.Y.Offset + delta.Y
-        )
-    end
+    activeDrag = {
+        onMove = function(x, y)
+            local dx, dy = x - startX, y - startY
+            MainFrame.Position = UDim2.new(
+                startFramePos.X.Scale, startFramePos.X.Offset + dx,
+                startFramePos.Y.Scale, startFramePos.Y.Offset + dy
+            )
+            Shadow.Position = UDim2.new(
+                startShadowPos.X.Scale, startShadowPos.X.Offset + dx,
+                startShadowPos.Y.Scale, startShadowPos.Y.Offset + dy
+            )
+        end,
+    }
 end)
 
 local function checkParry()
@@ -936,7 +989,7 @@ task.spawn(function()
         local ping = dataPing:GetValue()
         PingValue.Text = string.format("%.0fms", ping)
         PingValue.TextColor3 = ping > 200 and C.warnColor or C.text
-        
+
         if CONFIG.AccuracyMode == "auto" then
             local eff = getEffectiveAccuracy()
             accuracySlider.sub.Text = string.format("auto | eff: %.0f%%", eff)
@@ -948,9 +1001,71 @@ task.spawn(function()
     end
 end)
 
-closeBtn.MouseButton1Click:Connect(function()
+local MiniButton = Instance.new("TextButton")
+MiniButton.Name = "MiniButton"
+MiniButton.Size = UDim2.new(0, 100, 0, 32)
+MiniButton.Position = UDim2.new(0.5, -50, 0, 10)
+MiniButton.BackgroundColor3 = C.bg
+MiniButton.BorderSizePixel = 0
+MiniButton.Text = "HAHA.dll"
+MiniButton.TextColor3 = C.accent
+MiniButton.Font = Enum.Font.GothamBold
+MiniButton.TextSize = 13
+MiniButton.TextXAlignment = Enum.TextXAlignment.Center
+MiniButton.AutoButtonColor = false
+MiniButton.Visible = false
+MiniButton.Parent = ScreenGui
+Instance.new("UICorner", MiniButton).CornerRadius = UDim.new(1, 0)
+
+local miniStroke = Instance.new("UIStroke")
+miniStroke.Color = C.stroke
+miniStroke.Thickness = 1
+miniStroke.Parent = MiniButton
+
+local function setMinimized(min)
+    MainFrame.Visible = not min
+    Shadow.Visible = not min
+    MiniButton.Visible = min
+end
+
+MiniButton.MouseEnter:Connect(function()
+    tween(MiniButton, { BackgroundColor3 = C.cardHover })
+end)
+
+MiniButton.MouseLeave:Connect(function()
+    tween(MiniButton, { BackgroundColor3 = C.bg })
+end)
+
+MiniButton.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    local startX, startY = input.Position.X, input.Position.Y
+    local startPos = MiniButton.Position
+    local moved = false
+
+    activeDrag = {
+        onMove = function(x, y)
+            local dx, dy = x - startX, y - startY
+            if math.abs(dx) > 3 or math.abs(dy) > 3 then moved = true end
+            MiniButton.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + dx,
+                startPos.Y.Scale, startPos.Y.Offset + dy
+            )
+        end,
+        onEnd = function()
+            if not moved then setMinimized(false) end
+        end,
+    }
+end)
+
+MiniButton.MouseButton2Click:Connect(function()
     alive = false
     spamState.enabled = false
     triggerEnabled = false
     ScreenGui:Destroy()
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    setMinimized(true)
 end)
