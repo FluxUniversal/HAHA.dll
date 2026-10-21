@@ -28,6 +28,7 @@ local CONFIG = {
 local keybinds = {
     spam = Enum.KeyCode.X,
     trigger = Enum.KeyCode.C,
+    orbit = Enum.KeyCode.O,
 }
 
 local function keyName(k)
@@ -102,6 +103,69 @@ local function getAccuracyMultiplier()
     return 100 / cachedEffectiveAccuracy
 end
 
+-- ============= BALL ORBIT STATE =============
+local orbit = {
+    enabled = false,
+    angle = 0,
+    radius = 12,
+    speed = 6,
+    lastTick = os.clock(),
+    hrp = nil,
+}
+
+local function getOrbitHRP()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local orbitBallsCache = nil
+local orbitBallsCacheAt = 0
+local function getOrbitBall()
+    local now = os.clock()
+    if not orbitBallsCache or now - orbitBallsCacheAt > 0.1 then
+        orbitBallsCacheAt = now
+        orbitBallsCache = ws:FindFirstChild("Balls")
+    end
+    local folder = orbitBallsCache
+    if not folder then return nil end
+    local hrp = getOrbitHRP()
+    if not hrp then return nil end
+    local pos = hrp.Position
+    local closest, dist = nil, math.huge
+    for _, v in ipairs(folder:GetChildren()) do
+        if v:IsA("BasePart") then
+            local d = (pos - v.Position).Magnitude
+            if d < dist then
+                dist = d
+                closest = v
+            end
+        end
+    end
+    return closest
+end
+
+local function updateOrbit(dt)
+    if not orbit.enabled then return end
+    local hrp = getOrbitHRP()
+    if not hrp then return end
+    local ball = getOrbitBall()
+    if not ball then return end
+
+    orbit.angle = orbit.angle + orbit.speed * dt
+    if orbit.angle > math.pi * 2 then
+        orbit.angle = orbit.angle - math.pi * 2
+    end
+
+    local center = ball.Position
+    local offset = Vector3.new(
+        math.cos(orbit.angle) * orbit.radius,
+        math.sin(orbit.angle * 2) * 2,
+        math.sin(orbit.angle) * orbit.radius
+    )
+    hrp.CFrame = CFrame.new(center + offset)
+end
+
+-- ============= REMOTE HOOKING =============
 local remotesHook = {
     mt = {},
     orig = {},
@@ -536,6 +600,7 @@ task.spawn(function()
     end
 end)
 
+-- ============= NO RENDER =============
 local noRender = {
     enabled = false,
     saved = setmetatable({}, {__mode = "k"}),
@@ -770,7 +835,7 @@ local function disableNoRender()
     restoreNoRender()
 end
 
--- ============= SPAM ENGINE (fixed pre-alloc, hot-path optimized) =============
+-- ============= SPAM ENGINE =============
 local spamState = {
     enabled = false,
     rate = 100,
@@ -839,8 +904,7 @@ local function doSpamTick()
         fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
         fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
         i = i + 8
-    end
-    while i + 4 <= count do
+    end    while i + 4 <= count do
         fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
         fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
         fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
@@ -894,22 +958,26 @@ local function setUnlimitedKbps(enabled)
 end
 
 local C = {
-    bg = Color3.fromRGB(28, 28, 32),
-    card = Color3.fromRGB(40, 40, 46),
-    cardHover = Color3.fromRGB(48, 48, 55),
-    stroke = Color3.fromRGB(52, 52, 58),
+    bg = Color3.fromRGB(24, 24, 28),
+    bg2 = Color3.fromRGB(30, 30, 35),
+    card = Color3.fromRGB(38, 38, 44),
+    cardHover = Color3.fromRGB(46, 46, 53),
+    stroke = Color3.fromRGB(56, 56, 64),
+    strokeAccent = Color3.fromRGB(95, 200, 130),
     text = Color3.fromRGB(240, 240, 245),
-    textDim = Color3.fromRGB(150, 150, 160),
+    textDim = Color3.fromRGB(148, 148, 158),
+    textMuted = Color3.fromRGB(100, 100, 110),
     accent = Color3.fromRGB(95, 200, 130),
-    toggleOff = Color3.fromRGB(58, 58, 64),
-    knob = Color3.fromRGB(210, 210, 215),
+    accentDim = Color3.fromRGB(70, 150, 100),
+    toggleOff = Color3.fromRGB(56, 56, 64),
+    knob = Color3.fromRGB(220, 220, 228),
     danger = Color3.fromRGB(225, 95, 95),
-    warnColor = Color3.fromRGB(230, 180, 90),
-    keybg = Color3.fromRGB(22, 22, 26),
+    warn = Color3.fromRGB(230, 180, 90),
+    keybg = Color3.fromRGB(20, 20, 24),
 }
 
-local function tween(obj, props)
-    TweenService:Create(obj, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
+local function tween(obj, props, dur)
+    TweenService:Create(obj, TweenInfo.new(dur or 0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
 end
 
 local activeDrag = nil
@@ -941,22 +1009,22 @@ ScreenGui.DisplayOrder = 999
 ScreenGui.Parent = PlayerGui
 
 local Shadow = Instance.new("Frame")
-Shadow.Size = UDim2.new(0, 264, 0, 564)
-Shadow.Position = UDim2.new(0.5, -132, 0.5, -282)
+Shadow.Size = UDim2.new(0, 288, 0, 664)
+Shadow.Position = UDim2.new(0.5, -144, 0.5, -332)
 Shadow.BackgroundColor3 = Color3.new(0, 0, 0)
-Shadow.BackgroundTransparency = 0.5
+Shadow.BackgroundTransparency = 0.55
 Shadow.BorderSizePixel = 0
 Shadow.Parent = ScreenGui
-Instance.new("UICorner", Shadow).CornerRadius = UDim.new(0, 14)
+Instance.new("UICorner", Shadow).CornerRadius = UDim.new(0, 16)
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 260, 0, 560)
-MainFrame.Position = UDim2.new(0.5, -130, 0.5, -280)
+MainFrame.Size = UDim2.new(0, 284, 0, 660)
+MainFrame.Position = UDim2.new(0.5, -142, 0.5, -330)
 MainFrame.BackgroundColor3 = C.bg
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
 MainFrame.Parent = ScreenGui
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 14)
 
 local frameStroke = Instance.new("UIStroke")
 frameStroke.Color = C.stroke
@@ -965,21 +1033,38 @@ frameStroke.Parent = MainFrame
 
 local frameGrad = Instance.new("UIGradient")
 frameGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(32, 32, 36)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(24, 24, 28))
+    ColorSequenceKeypoint.new(0, C.bg2),
+    ColorSequenceKeypoint.new(1, C.bg)
 })
 frameGrad.Rotation = 90
 frameGrad.Parent = MainFrame
 
 local TitleBar = Instance.new("Frame")
 TitleBar.Name = "TitleBar"
-TitleBar.Size = UDim2.new(1, 0, 0, 40)
+TitleBar.Size = UDim2.new(1, 0, 0, 48)
 TitleBar.BackgroundTransparency = 1
 TitleBar.Parent = MainFrame
 
+local titleDot = Instance.new("Frame")
+titleDot.Size = UDim2.new(0, 8, 0, 8)
+titleDot.Position = UDim2.new(0, 18, 0.5, -4)
+titleDot.BackgroundColor3 = C.accent
+titleDot.BorderSizePixel = 0
+titleDot.Parent = TitleBar
+Instance.new("UICorner", titleDot).CornerRadius = UDim.new(1, 0)
+
+local titleGlow = Instance.new("Frame")
+titleGlow.Size = UDim2.new(0, 16, 0, 16)
+titleGlow.Position = UDim2.new(0, 14, 0.5, -8)
+titleGlow.BackgroundColor3 = C.accent
+titleGlow.BackgroundTransparency = 0.85
+titleGlow.BorderSizePixel = 0
+titleGlow.Parent = TitleBar
+Instance.new("UICorner", titleGlow).CornerRadius = UDim.new(1, 0)
+
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -80, 1, 0)
-title.Position = UDim2.new(0, 16, 0, 0)
+title.Size = UDim2.new(1, -110, 1, 0)
+title.Position = UDim2.new(0, 40, 0, 0)
 title.BackgroundTransparency = 1
 title.Text = "HAHA.dll"
 title.TextColor3 = C.text
@@ -988,31 +1073,56 @@ title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = TitleBar
 
+local titleSub = Instance.new("TextLabel")
+titleSub.Size = UDim2.new(1, -110, 0, 12)
+titleSub.Position = UDim2.new(0, 40, 0, 28)
+titleSub.BackgroundTransparency = 1
+titleSub.Text = "by HAHA"
+titleSub.TextColor3 = C.textMuted
+titleSub.Font = Enum.Font.Gotham
+titleSub.TextSize = 9
+titleSub.TextXAlignment = Enum.TextXAlignment.Left
+titleSub.Parent = TitleBar
+
 local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 24, 0, 24)
-closeBtn.Position = UDim2.new(1, -34, 0.5, -12)
-closeBtn.BackgroundColor3 = Color3.fromRGB(46, 46, 52)
+closeBtn.Size = UDim2.new(0, 26, 0, 26)
+closeBtn.Position = UDim2.new(1, -38, 0.5, -13)
+closeBtn.BackgroundColor3 = C.card
 closeBtn.BorderSizePixel = 0
 closeBtn.Text = "×"
 closeBtn.TextColor3 = C.textDim
 closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 18
+closeBtn.TextSize = 20
 closeBtn.AutoButtonColor = false
 closeBtn.Parent = TitleBar
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 7)
 
 local divider = Instance.new("Frame")
-divider.Size = UDim2.new(1, -32, 0, 1)
-divider.Position = UDim2.new(0, 16, 0, 40)
+divider.Size = UDim2.new(1, -36, 0, 1)
+divider.Position = UDim2.new(0, 18, 0, 48)
 divider.BackgroundColor3 = C.stroke
-divider.BackgroundTransparency = 0.3
+divider.BackgroundTransparency = 0.5
 divider.BorderSizePixel = 0
 divider.Parent = MainFrame
 
+local function makeSectionLabel(y, text)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -36, 0, 14)
+    lbl.Position = UDim2.new(0, 18, 0, y)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = text:upper()
+    lbl.TextColor3 = C.textMuted
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = MainFrame
+    return lbl
+end
+
 local function makeKeybindBox(row, keybindsTable, keyName2)
     local box = Instance.new("TextBox")
-    box.Size = UDim2.new(0, 60, 0, 22)
-    box.Position = UDim2.new(0, 106, 0.5, -11)
+    box.Size = UDim2.new(0, 56, 0, 22)
+    box.Position = UDim2.new(0, 104, 0.5, -11)
     box.BackgroundColor3 = C.keybg
     box.BorderSizePixel = 0
     box.Text = keyName(keybindsTable[keyName2])
@@ -1033,6 +1143,7 @@ local function makeKeybindBox(row, keybindsTable, keyName2)
         armingKey = { table = keybindsTable, name = keyName2 }
         box.Text = "..."
         stroke.Color = C.accent
+        stroke.Thickness = 2
     end)
     box.FocusLost:Connect(function()
         if armingBox == box then
@@ -1041,23 +1152,24 @@ local function makeKeybindBox(row, keybindsTable, keyName2)
         end
         box.Text = keyName(keybindsTable[keyName2])
         stroke.Color = C.stroke
+        stroke.Thickness = 1
     end)
     return box
 end
 
 local function makeToggleRow(yPos, label, onChanged, keybindTarget)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, -32, 0, 44)
-    row.Position = UDim2.new(0, 16, 0, yPos)
+    row.Size = UDim2.new(1, -36, 0, 46)
+    row.Position = UDim2.new(0, 18, 0, yPos)
     row.BackgroundColor3 = C.card
     row.BorderSizePixel = 0
     row.Text = ""
     row.AutoButtonColor = false
     row.Parent = MainFrame
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, keybindTarget and -140 or -80, 1, 0)
+    lbl.Size = UDim2.new(1, keybindTarget and -148 or -90, 1, 0)
     lbl.Position = UDim2.new(0, 14, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = label
@@ -1092,7 +1204,7 @@ local function makeToggleRow(yPos, label, onChanged, keybindTarget)
         state = s
         tween(knob, {
             Position = s and UDim2.new(0, 21, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
-        })
+        }, 0.2)
         TweenService:Create(bg, TweenInfo.new(0.2), {
             BackgroundColor3 = s and C.accent or C.toggleOff
         }):Play()
@@ -1115,16 +1227,16 @@ end
 
 local function makeSlider(yPos, label, min, max, initial, onChanged)
     local container = Instance.new("Frame")
-    container.Size = UDim2.new(1, -32, 0, 56)
-    container.Position = UDim2.new(0, 16, 0, yPos)
+    container.Size = UDim2.new(1, -36, 0, 62)
+    container.Position = UDim2.new(0, 18, 0, yPos)
     container.BackgroundColor3 = C.card
     container.BorderSizePixel = 0
     container.Parent = MainFrame
-    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 8)
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 10)
 
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.6, 0, 0, 16)
-    lbl.Position = UDim2.new(0, 12, 0, 3)
+    lbl.Position = UDim2.new(0, 14, 0, 6)
     lbl.BackgroundTransparency = 1
     lbl.Text = label
     lbl.TextColor3 = C.text
@@ -1135,7 +1247,7 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 
     local valLabel = Instance.new("TextLabel")
     valLabel.Size = UDim2.new(0.35, 0, 0, 16)
-    valLabel.Position = UDim2.new(0.65, 0, 0, 3)
+    valLabel.Position = UDim2.new(0.65, 0, 0, 6)
     valLabel.BackgroundTransparency = 1
     valLabel.Text = tostring(initial)
     valLabel.TextColor3 = C.accent
@@ -1145,19 +1257,19 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
     valLabel.Parent = container
 
     local sub = Instance.new("TextLabel")
-    sub.Size = UDim2.new(1, -24, 0, 12)
-    sub.Position = UDim2.new(0, 12, 0, 19)
+    sub.Size = UDim2.new(1, -28, 0, 12)
+    sub.Position = UDim2.new(0, 14, 0, 24)
     sub.BackgroundTransparency = 1
     sub.Text = ""
-    sub.TextColor3 = C.textDim
+    sub.TextColor3 = C.textMuted
     sub.Font = Enum.Font.Gotham
     sub.TextSize = 10
     sub.TextXAlignment = Enum.TextXAlignment.Left
     sub.Parent = container
 
     local track = Instance.new("Frame")
-    track.Size = UDim2.new(1, -24, 0, 6)
-    track.Position = UDim2.new(0, 12, 1, -14)
+    track.Size = UDim2.new(1, -28, 0, 6)
+    track.Position = UDim2.new(0, 14, 1, -16)
     track.BackgroundColor3 = C.toggleOff
     track.BorderSizePixel = 0
     track.Parent = container
@@ -1224,39 +1336,22 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 end
 
 local AutoParry = false
-local spamToggle, triggerToggle
+local spamToggle, triggerToggle, orbitToggle
 
-spamToggle = makeToggleRow(52, "Auto parry", function(s)
-    AutoParry = s
-end)
-
-spamToggle = makeToggleRow(104, "Manual spam", function(s)
+makeSectionLabel(58, "Combat")
+spamToggle = makeToggleRow(74, "Auto parry", function(s) AutoParry = s end)
+spamToggle = makeToggleRow(124, "Manual spam", function(s)
     spamState.enabled = s
     spamState.accumulator = 0
     spamState.lastFrame = os.clock()
     if s then
-        if next(remotesHook.captured) ~= nil then
-            refreshHot()
-        end
+        if next(remotesHook.captured) ~= nil then refreshHot() end
         if not refreshLoopConn then
             refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
         end
     end
 end, { table = keybinds, name = "spam" })
-
-makeToggleRow(156, "Unlimited KBPS", function(s)
-    setUnlimitedKbps(s)
-end)
-
-makeToggleRow(208, "No Render", function(s)
-    if s then enableNoRender() else disableNoRender() end
-end)
-
-makeSlider(260, "Spam rate (/s)", 100, 500, spamState.rate, function(v)
-    spamState.rate = v
-end)
-
-triggerToggle = makeToggleRow(324, "Triggerbot", function(s)
+triggerToggle = makeToggleRow(174, "Triggerbot", function(s)
     triggerEnabled = s
     if s then
         for _, ball in ipairs(getRealBalls()) do
@@ -1265,34 +1360,46 @@ triggerToggle = makeToggleRow(324, "Triggerbot", function(s)
     end
 end, { table = keybinds, name = "trigger" })
 
-local accuracySlider = makeSlider(376, "Accuracy", 40, 100, CONFIG.Accuracy, function(v)
-    CONFIG.Accuracy = v
+makeSectionLabel(232, "Movement")
+orbitToggle = makeToggleRow(248, "Ball Orbit", function(s)
+    orbit.enabled = s
+    orbit.angle = 0
+    orbit.lastTick = os.clock()
+end, { table = keybinds, name = "orbit" })
+
+makeSectionLabel(306, "Performance")
+makeToggleRow(322, "Unlimited KBPS", function(s) setUnlimitedKbps(s) end)
+makeToggleRow(372, "No Render", function(s)
+    if s then enableNoRender() else disableNoRender() end
 end)
 
-makeToggleRow(440, "Auto accuracy", function(s)
+makeSectionLabel(430, "Tuning")
+makeSlider(446, "Spam rate (/s)", 100, 500, spamState.rate, function(v) spamState.rate = v end)
+local accuracySlider = makeSlider(512, "Accuracy", 40, 100, CONFIG.Accuracy, function(v) CONFIG.Accuracy = v end)
+makeToggleRow(578, "Auto accuracy", function(s)
     CONFIG.AccuracyMode = s and "auto" or "manual"
     lastAccuracyCalc = 0
 end)
 
 local StatsCard = Instance.new("Frame")
-StatsCard.Size = UDim2.new(1, -32, 0, 56)
-StatsCard.Position = UDim2.new(0, 16, 0, 492)
+StatsCard.Size = UDim2.new(1, -36, 0, 56)
+StatsCard.Position = UDim2.new(0, 18, 0, 630)
 StatsCard.BackgroundColor3 = C.card
 StatsCard.BorderSizePixel = 0
 StatsCard.Parent = MainFrame
-Instance.new("UICorner", StatsCard).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", StatsCard).CornerRadius = UDim.new(0, 10)
 
 local statsGrad = Instance.new("UIGradient")
 statsGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(44, 44, 50)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(38, 38, 44))
+    ColorSequenceKeypoint.new(0, C.card),
+    ColorSequenceKeypoint.new(1, C.cardHover)
 })
 statsGrad.Rotation = 90
 statsGrad.Parent = StatsCard
 
 local VelocityLabel = Instance.new("TextLabel")
 VelocityLabel.Size = UDim2.new(0.5, 0, 0.5, 0)
-VelocityLabel.Position = UDim2.new(0, 14, 0, 5)
+VelocityLabel.Position = UDim2.new(0, 16, 0, 6)
 VelocityLabel.BackgroundTransparency = 1
 VelocityLabel.Text = "Ball velocity"
 VelocityLabel.TextColor3 = C.textDim
@@ -1303,7 +1410,7 @@ VelocityLabel.Parent = StatsCard
 
 local VelocityValue = Instance.new("TextLabel")
 VelocityValue.Size = UDim2.new(0.5, 0, 0.5, 0)
-VelocityValue.Position = UDim2.new(0.5, -14, 0, 5)
+VelocityValue.Position = UDim2.new(0.5, -16, 0, 6)
 VelocityValue.BackgroundTransparency = 1
 VelocityValue.Text = "--"
 VelocityValue.TextColor3 = C.text
@@ -1314,7 +1421,7 @@ VelocityValue.Parent = StatsCard
 
 local PingLabel = Instance.new("TextLabel")
 PingLabel.Size = UDim2.new(0.5, 0, 0.5, 0)
-PingLabel.Position = UDim2.new(0, 14, 0.5, 5)
+PingLabel.Position = UDim2.new(0, 16, 0.5, 6)
 PingLabel.BackgroundTransparency = 1
 PingLabel.Text = "Ping"
 PingLabel.TextColor3 = C.textDim
@@ -1325,7 +1432,7 @@ PingLabel.Parent = StatsCard
 
 local PingValue = Instance.new("TextLabel")
 PingValue.Size = UDim2.new(0.5, 0, 0.5, 0)
-PingValue.Position = UDim2.new(0.5, -14, 0.5, 5)
+PingValue.Position = UDim2.new(0.5, -16, 0.5, 6)
 PingValue.BackgroundTransparency = 1
 PingValue.Text = "--"
 PingValue.TextColor3 = C.text
@@ -1335,11 +1442,11 @@ PingValue.TextXAlignment = Enum.TextXAlignment.Right
 PingValue.Parent = StatsCard
 
 closeBtn.MouseEnter:Connect(function()
-    tween(closeBtn, { BackgroundColor3 = C.danger, TextColor3 = Color3.fromRGB(255, 255, 255) })
+    tween(closeBtn, { BackgroundColor3 = C.danger, TextColor3 = Color3.fromRGB(255, 255, 255) }, 0.12)
 end)
 
 closeBtn.MouseLeave:Connect(function()
-    tween(closeBtn, { BackgroundColor3 = Color3.fromRGB(46, 46, 52), TextColor3 = C.textDim })
+    tween(closeBtn, { BackgroundColor3 = C.card, TextColor3 = C.textDim }, 0.12)
 end)
 
 TitleBar.InputBegan:Connect(function(input)
@@ -1390,6 +1497,8 @@ UserInputService.InputBegan:Connect(function(input, gp)
             spamToggle.set(not spamToggle.get())
         elseif keybinds.trigger and input.KeyCode == keybinds.trigger then
             triggerToggle.set(not triggerToggle.get())
+        elseif keybinds.orbit and input.KeyCode == keybinds.orbit then
+            orbitToggle.set(not orbitToggle.get())
         end
     end
 end)
@@ -1446,6 +1555,17 @@ RunService.PostSimulation:Connect(function()
     checkParry()
 end)
 
+local function orbitHeartbeat()
+    if not orbit.enabled then return end
+    local now = os.clock()
+    local dt = now - orbit.lastTick
+    orbit.lastTick = now
+    if dt > 0.1 then dt = 0.1 end
+    updateOrbit(dt)
+end
+
+RunService.Heartbeat:Connect(orbitHeartbeat)
+
 local alive = true
 task.spawn(function()
     while alive do
@@ -1460,7 +1580,7 @@ task.spawn(function()
         if maxSpeed > 0 then
             local vText = string.format("%.0f", maxSpeed)
             if VelocityValue.Text ~= vText then VelocityValue.Text = vText end
-            VelocityValue.TextColor3 = maxSpeed >= 2200 and C.warnColor or C.text
+            VelocityValue.TextColor3 = maxSpeed >= 2200 and C.warn or C.text
         else
             if VelocityValue.Text ~= "--" then VelocityValue.Text = "--" end
             VelocityValue.TextColor3 = C.textDim
@@ -1468,7 +1588,7 @@ task.spawn(function()
         local ping = pingSmoothed > 0 and pingSmoothed or dataPing:GetValue()
         local pText = string.format("%.0fms", ping)
         if PingValue.Text ~= pText then PingValue.Text = pText end
-        PingValue.TextColor3 = ping > 200 and C.warnColor or C.text
+        PingValue.TextColor3 = ping > 200 and C.warn or C.text
         if CONFIG.AccuracyMode == "auto" then
             local eff = getEffectiveAccuracy()
             accuracySlider.sub.Text = string.format("auto | eff: %.0f%% | j: %.0f", eff, pingJitter)
@@ -1481,8 +1601,8 @@ end)
 
 local MiniButton = Instance.new("TextButton")
 MiniButton.Name = "MiniButton"
-MiniButton.Size = UDim2.new(0, 100, 0, 32)
-MiniButton.Position = UDim2.new(0.5, -50, 0, 10)
+MiniButton.Size = UDim2.new(0, 108, 0, 34)
+MiniButton.Position = UDim2.new(0.5, -54, 0, 12)
 MiniButton.BackgroundColor3 = C.bg
 MiniButton.BorderSizePixel = 0
 MiniButton.Text = "HAHA.dll"
@@ -1500,6 +1620,14 @@ miniStroke.Color = C.stroke
 miniStroke.Thickness = 1
 miniStroke.Parent = MiniButton
 
+local miniDot = Instance.new("Frame")
+miniDot.Size = UDim2.new(0, 7, 0, 7)
+miniDot.Position = UDim2.new(0, 14, 0.5, -3.5)
+miniDot.BackgroundColor3 = C.accent
+miniDot.BorderSizePixel = 0
+miniDot.Parent = MiniButton
+Instance.new("UICorner", miniDot).CornerRadius = UDim.new(1, 0)
+
 local function setMinimized(min)
     MainFrame.Visible = not min
     Shadow.Visible = not min
@@ -1507,11 +1635,11 @@ local function setMinimized(min)
 end
 
 MiniButton.MouseEnter:Connect(function()
-    tween(MiniButton, { BackgroundColor3 = C.cardHover })
+    tween(MiniButton, { BackgroundColor3 = C.cardHover }, 0.12)
 end)
 
 MiniButton.MouseLeave:Connect(function()
-    tween(MiniButton, { BackgroundColor3 = C.bg })
+    tween(MiniButton, { BackgroundColor3 = C.bg }, 0.12)
 end)
 
 MiniButton.InputBegan:Connect(function(input)
@@ -1539,6 +1667,7 @@ MiniButton.MouseButton2Click:Connect(function()
     alive = false
     spamState.enabled = false
     triggerEnabled = false
+    orbit.enabled = false
     if renderTickConn then renderTickConn:Disconnect() end
     if refreshLoopConn then refreshLoopConn:Disconnect() end
     if noRender.enabled then disableNoRender() end
