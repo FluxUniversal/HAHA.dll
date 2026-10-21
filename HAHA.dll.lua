@@ -770,6 +770,7 @@ local function disableNoRender()
     restoreNoRender()
 end
 
+-- ============= SPAM ENGINE (fixed pre-alloc, hot-path optimized) =============
 local spamState = {
     enabled = false,
     rate = 100,
@@ -777,22 +778,19 @@ local spamState = {
     lastFrame = os.clock(),
     maxDt = 0.05,
     maxGuard = 20,
-    argCache = nil,
 }
 
-local function ensureArgCache()
-    if spamState.argCache then return spamState.argCache end
-    local a = table.create(9)
-    a[1] = hotArgs1
-    a[2] = hotArgs2
-    a[3] = cachedToken
-    a[4] = cachedScale
-    a[5] = cachedCframe
-    a[6] = cachedScreen
-    a[7] = cachedAim
-    a[8] = false
-    spamState.argCache = a
-    return a
+local arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
+
+local function refreshSpamArgs()
+    arg1 = hotArgs1
+    arg2 = hotArgs2
+    arg3 = cachedToken
+    arg4 = cachedScale
+    arg5 = cachedCframe
+    arg6 = cachedScreen
+    arg7 = cachedAim
+    arg8 = false
 end
 
 local function doSpamTick()
@@ -812,40 +810,45 @@ local function doSpamTick()
     local maxDt = spamState.maxDt
     if dt > maxDt then dt = maxDt end
 
-    local acc = spamState.accumulator + dt * spamState.rate
+    local rate = spamState.rate
+    local acc = spamState.accumulator + dt * rate
     if acc < 1 then
         spamState.accumulator = acc
         return
     end
-    if acc > spamState.maxGuard then acc = spamState.maxGuard end
+    local guard = spamState.maxGuard
+    if acc > guard then acc = guard end
     local count = math.floor(acc)
     spamState.accumulator = acc - count
 
     refreshPayload()
     refreshCachedToken()
+    refreshSpamArgs()
 
-    local a = ensureArgCache()
-    a[1] = hotArgs1
-    a[2] = hotArgs2
-    a[3] = cachedToken
-    a[4] = cachedScale
-    a[5] = cachedCframe
-    a[6] = cachedScreen
-    a[7] = cachedAim
-    a[8] = false
-
-    local r1, r2, r3, r4, r5, r6, r7, r8 = a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]
+    local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
+    local fn = method
 
     local i = 0
+    while i + 8 <= count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 8
+    end
     while i + 4 <= count do
-        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
-        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
-        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
-        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
         i = i + 4
     end
     while i < count do
-        method(remote, r1, r2, r3, r4, r5, r6, r7, r8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
         i = i + 1
     end
 end
