@@ -40,6 +40,9 @@ local armingBox = nil
 local armingKey = nil
 
 local unlimitedKbps = false
+local infiniteMode = false
+local INFINITE_BURST = 40
+local INFINITE_BURST_KB = 50
 local payloadRefreshThreshold = 0.016
 local screenRefreshThreshold = 0.016
 local lastScreenRefresh = 0
@@ -103,14 +106,12 @@ local function getAccuracyMultiplier()
     return 100 / cachedEffectiveAccuracy
 end
 
--- ============= BALL ORBIT STATE =============
 local orbit = {
     enabled = false,
     angle = 0,
     radius = 12,
     speed = 6,
     lastTick = os.clock(),
-    hrp = nil,
 }
 
 local function getOrbitHRP()
@@ -150,12 +151,10 @@ local function updateOrbit(dt)
     if not hrp then return end
     local ball = getOrbitBall()
     if not ball then return end
-
     orbit.angle = orbit.angle + orbit.speed * dt
     if orbit.angle > math.pi * 2 then
         orbit.angle = orbit.angle - math.pi * 2
     end
-
     local center = ball.Position
     local offset = Vector3.new(
         math.cos(orbit.angle) * orbit.radius,
@@ -165,7 +164,6 @@ local function updateOrbit(dt)
     hrp.CFrame = CFrame.new(center + offset)
 end
 
--- ============= REMOTE HOOKING =============
 local remotesHook = {
     mt = {},
     orig = {},
@@ -232,7 +230,6 @@ local function hookRemote(inst)
     setreadonly(mt, false)
     local origIdx = mt.__index
     remotesHook.orig[mt] = origIdx
-
     mt.__index = function(self, key)
         if not remotesHook.done and (key == "FireServer" or key == "InvokeServer") then
             local realFn = origIdx(self, key)
@@ -255,7 +252,6 @@ local function hookRemote(inst)
         end
         return origIdx(self, key)
     end
-
     setreadonly(mt, true)
 end
 
@@ -600,12 +596,12 @@ task.spawn(function()
     end
 end)
 
--- ============= NO RENDER =============
 local noRender = {
     enabled = false,
     saved = setmetatable({}, {__mode = "k"}),
     enabledHooks = setmetatable({}, {__mode = "k"}),
     count = 0,
+    sweepConn = nil,
 }
 
 local function saveProp(inst, prop)
@@ -623,60 +619,167 @@ local function saveProp(inst, prop)
     end
 end
 
-local function disableTransparency(inst)
-    saveProp(inst, "Transparency")
-    pcall(function() inst.Transparency = 1 end)
+local function killProp(inst, prop, killer)
+    local ok, cur = pcall(function() return inst[prop] end)
+    if not ok then return end
+    if cur == killer then return end
+    saveProp(inst, prop)
+    pcall(function() inst[prop] = killer end)
 end
 
-local function disableVisible(inst)
-    saveProp(inst, "Visible")
-    pcall(function() inst.Visible = false end)
+local function killEnabled(inst)
+    killProp(inst, "Enabled", false)
+    if not noRender.enabledHooks[inst] then
+        local conn = inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if noRender.enabled then
+                pcall(function()
+                    if inst.Enabled then
+                        saveProp(inst, "Enabled")
+                        inst.Enabled = false
+                    end
+                end)
+            end
+        end)
+        noRender.enabledHooks[inst] = conn
+    end
 end
 
-local function disableShadow(part)
-    saveProp(part, "CastShadow")
-    pcall(function() part.CastShadow = false end)
+local function killTransparency(inst)
+    killProp(inst, "Transparency", 1)
 end
 
-local function hookEnabled(inst)
-    if noRender.enabledHooks[inst] then return end
-    local conn = inst:GetPropertyChangedSignal("Enabled"):Connect(function()
-        if noRender.enabled and inst.Enabled then
-            saveProp(inst, "Enabled")
-            pcall(function() inst.Enabled = false end)
+local function killVisible(inst)
+    killProp(inst, "Visible", false)
+end
+
+local function killShadow(inst)
+    killProp(inst, "CastShadow", false)
+end
+
+local function killImage(inst)
+    killProp(inst, "Image", "")
+    killProp(inst, "ImageTransparency", 1)
+end
+
+local function killMeshTexture(inst)
+    killProp(inst, "Texture", "")
+end
+
+local function killSound(inst)
+    killProp(inst, "Volume", 0)
+    pcall(function() inst:Stop() end)
+    if not noRender.enabledHooks[inst] then
+        local conn = inst.Played:Connect(function()
+            if noRender.enabled then
+                pcall(function() inst:Stop() end)
+            end
+        end)
+        noRender.enabledHooks[inst] = conn
+    end
+end
+
+local function killPostFX(inst)
+    killProp(inst, "Enabled", false)
+end
+
+local function killAtmosphere(inst)
+    killProp(inst, "Density", 0)
+    killProp(inst, "Haze", 0)
+    killProp(inst, "Glare", 0)
+end
+
+local function killClouds(inst)
+    killProp(inst, "Cover", 0)
+    killProp(inst, "Density", 0)
+end
+
+local function killSky(inst)
+    for _, p in ipairs({
+        "SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp",
+        "SunTextureId","MoonTextureId"
+    }) do
+        killProp(inst, p, "")
+    end
+    killProp(inst, "StarCount", 0)
+end
+
+local function killTerrain(terrain)
+    killProp(terrain, "WaterWaveSize", 0)
+    killProp(terrain, "WaterWaveSpeed", 0)
+    killProp(terrain, "WaterReflectance", 0)
+end
+
+local function killEffect(inst)
+    local cls = inst.ClassName
+    if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+        or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
+        or cls == "Explosion" or cls == "Highlight" then
+        killEnabled(inst)
+        if cls == "ParticleEmitter" or cls == "Fire" or cls == "Smoke" then
+            killProp(inst, "Rate", 0)
+            killProp(inst, "Brightness", 0)
         end
-    end)
-    noRender.enabledHooks[inst] = conn
-end
-
-local function shouldDisable(inst)
-    local cls = inst.ClassName
-    if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
-        or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
-        or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
-        or cls == "Highlight" or cls == "BillboardGui" or cls == "SurfaceGui" then
-        return true
-    end
-    if cls == "Decal" or cls == "Texture" or cls == "ViewportFrame" or cls == "Explosion" then
-        return true
-    end
-    return false
-end
-
-local function disableEffect(inst)
-    if not noRender.enabled then return end
-    local cls = inst.ClassName
-    if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
-        or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
-        or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
-        or cls == "Highlight" or cls == "BillboardGui" or cls == "SurfaceGui" then
-        saveProp(inst, "Enabled")
-        pcall(function() inst.Enabled = false end)
-        hookEnabled(inst)
+        if cls == "Trail" or cls == "Beam" then
+            killProp(inst, "Transparency", NumberSequence.new(1))
+            killProp(inst, "LightEmission", 0)
+        end
+        if cls == "Highlight" then
+            killProp(inst, "FillTransparency", 1)
+            killProp(inst, "OutlineTransparency", 1)
+        end
+    elseif cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight" then
+        killEnabled(inst)
+        killProp(inst, "Brightness", 0)
+        killProp(inst, "Range", 0)
     elseif cls == "Decal" or cls == "Texture" then
-        disableTransparency(inst)
-    elseif cls == "ViewportFrame" or cls == "Explosion" then
-        disableVisible(inst)
+        killTransparency(inst)
+        if cls == "Texture" then
+            killMeshTexture(inst)
+        end
+    elseif cls == "SurfaceGui" or cls == "BillboardGui" then
+        killEnabled(inst)
+    elseif cls == "ViewportFrame" then
+        killVisible(inst)
+    elseif cls == "Sound" or cls == "SoundGroup" then
+        killSound(inst)
+    end
+end
+
+local function killEnv(inst)
+    if inst:IsA("PostEffect") then
+        killPostFX(inst)
+    elseif inst:IsA("Atmosphere") then
+        killAtmosphere(inst)
+    elseif inst:IsA("Clouds") then
+        killClouds(inst)
+    elseif inst:IsA("Sky") then
+        killSky(inst)
+    end
+end
+
+local function killAllInRoot(root, skipPlayerGui)
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("BasePart") then
+            killShadow(d)
+            if d:FindFirstAncestorWhichIsA("Accessory") then
+                killTransparency(d)
+            end
+        end
+        if skipPlayerGui and d:IsDescendantOf(PlayerGui) then
+            continue
+        end
+        local cls = d.ClassName
+        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+            or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
+            or cls == "Explosion" or cls == "Highlight"
+            or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
+            or cls == "Decal" or cls == "Texture"
+            or cls == "SurfaceGui" or cls == "BillboardGui" or cls == "ViewportFrame"
+            or cls == "Sound" or cls == "SoundGroup" then
+            killEffect(d)
+        elseif cls == "ImageLabel" or cls == "ImageButton" then
+            killImage(d)
+        end
     end
 end
 
@@ -693,50 +796,29 @@ local function applyNoRender()
     pcall(function() s.ShadowSoftness = Lighting.ShadowSoftness end)
     s.FogEnd = Lighting.FogEnd
     s.FogStart = Lighting.FogStart
-    Lighting.Ambient = Color3.new(0, 0, 0)
-    Lighting.OutdoorAmbient = Color3.new(0, 0, 0)
-    Lighting.Brightness = 1
+    s.ClockTime = Lighting.ClockTime
+
+    Lighting.Ambient = Color3.fromRGB(180, 180, 180)
+    Lighting.OutdoorAmbient = Color3.fromRGB(180, 180, 180)
+    Lighting.Brightness = 2
     Lighting.GlobalShadows = false
-    pcall(function() Lighting.EnvironmentDiffuseScale = 0 end)
-    pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+    pcall(function() Lighting.EnvironmentDiffuseScale = 0.5 end)
+    pcall(function() Lighting.EnvironmentSpecularScale = 0.5 end)
     pcall(function() Lighting.ShadowSoftness = 0 end)
     Lighting.FogEnd = 1e10
     Lighting.FogStart = 0
+    Lighting.ClockTime = 12
+
     for _, c in ipairs(Lighting:GetChildren()) do
-        if c:IsA("PostEffect") then
-            saveProp(c, "Enabled")
-            pcall(function() c.Enabled = false end)
-        elseif c:IsA("Atmosphere") then
-            saveProp(c, "Density")
-            pcall(function() c.Density = 0 end)
-        elseif c:IsA("Clouds") then
-            saveProp(c, "Cover")
-            pcall(function() c.Cover = 0 end)
-        elseif c:IsA("Sky") then
-            for _, p in ipairs({"SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp","SunTextureId","MoonTextureId"}) do
-                saveProp(c, p)
-                pcall(function() c[p] = "" end)
-            end
-        end
+        killEnv(c)
     end
+
     local terrain = ws:FindFirstChildOfClass("Terrain")
     if terrain then
-        saveProp(terrain, "WaterWaveSize")
-        saveProp(terrain, "WaterWaveSpeed")
-        pcall(function() terrain.WaterWaveSize = 0 end)
-        pcall(function() terrain.WaterWaveSpeed = 0 end)
+        killTerrain(terrain)
     end
-    for _, d in ipairs(ws:GetDescendants()) do
-        if d:IsA("BasePart") then
-            disableShadow(d)
-            if d:FindFirstAncestorWhichIsA("Accessory") then
-                disableTransparency(d)
-            end
-        end
-        if shouldDisable(d) then
-            disableEffect(d)
-        end
-    end
+
+    killAllInRoot(ws, true)
 end
 
 local function restoreNoRender()
@@ -752,6 +834,7 @@ local function restoreNoRender()
                 if s.ShadowSoftness then Lighting.ShadowSoftness = s.ShadowSoftness end
                 if s.FogEnd then Lighting.FogEnd = s.FogEnd end
                 if s.FogStart then Lighting.FogStart = s.FogStart end
+                if s.ClockTime then Lighting.ClockTime = s.ClockTime end
             end)
         else
             for prop, v in next, s do
@@ -767,75 +850,70 @@ local function restoreNoRender()
     noRender.count = 0
 end
 
-local wsDescConn = nil
-local sweepRunning = false
-
-local function noRenderSweepLoop()
-    if sweepRunning then return end
-    sweepRunning = true
-    task.spawn(function()
-        while noRender.enabled do
-            task.wait(2)
-            if not noRender.enabled then break end
-            for _, d in ipairs(ws:GetDescendants()) do
-                if d:IsA("BasePart") then
-                    if d.CastShadow then disableShadow(d) end
-                    if d:FindFirstAncestorWhichIsA("Accessory") and d.Transparency ~= 1 then
-                        disableTransparency(d)
-                    end
-                end
-                if shouldDisable(d) then
-                    if (d:IsA("ParticleEmitter") or d:IsA("Trail") or d:IsA("Beam")
-                        or d:IsA("PointLight") or d:IsA("SpotLight") or d:IsA("SurfaceLight")
-                        or d:IsA("Highlight") or d:IsA("BillboardGui") or d:IsA("SurfaceGui"))
-                        and d.Enabled then
-                        disableEffect(d)
-                    elseif (d:IsA("Decal") or d:IsA("Texture")) and d.Transparency ~= 1 then
-                        disableEffect(d)
-                    elseif (d:IsA("ViewportFrame") or d:IsA("Explosion")) and d.Visible then
-                        disableEffect(d)
-                    end
-                end
-            end
-        end
-        sweepRunning = false
-    end)
-end
-
 local function enableNoRender()
     if noRender.enabled then return end
     noRender.enabled = true
     applyNoRender()
-    wsDescConn = ws.DescendantAdded:Connect(function(d)
-        if not noRender.enabled then return end
-        if d:IsA("BasePart") then
-            disableShadow(d)
-            if d:FindFirstAncestorWhichIsA("Accessory") then
-                task.defer(function()
-                    if noRender.enabled and d.Parent then disableTransparency(d) end
-                end)
+
+    local sweeping = false
+    local function resweep()
+        if sweeping or not noRender.enabled then return end
+        sweeping = true
+        task.spawn(function()
+            while noRender.enabled do
+                task.wait(0.5)
+                if not noRender.enabled then break end
+                killAllInRoot(ws, true)
             end
-        end
-        if shouldDisable(d) then
-            task.defer(function()
-                if noRender.enabled and d.Parent then disableEffect(d) end
-            end)
-        end
+            sweeping = false
+        end)
+    end
+
+    local descConn = ws.DescendantAdded:Connect(function(d)
+        if not noRender.enabled then return end
+        if d:IsDescendantOf(PlayerGui) then return end
+        task.defer(function()
+            if not noRender.enabled or not d.Parent then return end
+            if d:IsA("BasePart") then
+                killShadow(d)
+                if d:FindFirstAncestorWhichIsA("Accessory") then
+                    killTransparency(d)
+                end
+            end
+            killEffect(d)
+            if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+                killImage(d)
+            end
+        end)
     end)
-    noRenderSweepLoop()
+
+    local lightingConn = Lighting.ChildAdded:Connect(function(c)
+        if not noRender.enabled then return end
+        task.defer(function()
+            if not noRender.enabled or not c.Parent then return end
+            killEnv(c)
+        end)
+    end)
+
+    noRender.sweepConn = {
+        descConn = descConn,
+        lightingConn = lightingConn,
+    }
+
+    resweep()
 end
 
 local function disableNoRender()
     if not noRender.enabled then return end
     noRender.enabled = false
-    if wsDescConn then
-        wsDescConn:Disconnect()
-        wsDescConn = nil
+    if noRender.sweepConn then
+        if noRender.sweepConn.descConn then noRender.sweepConn.descConn:Disconnect() end
+        if noRender.sweepConn.lightingConn then noRender.sweepConn.lightingConn:Disconnect() end
+        noRender.sweepConn = nil
     end
     restoreNoRender()
 end
 
--- ============= SPAM ENGINE =============
 local spamState = {
     enabled = false,
     rate = 100,
@@ -844,6 +922,12 @@ local spamState = {
     maxDt = 0.05,
     maxGuard = 20,
 }
+
+local function refreshGuard()
+    local base = unlimitedKbps and 0.15 or 0.05
+    spamState.maxDt = base
+    spamState.maxGuard = math.max(20, math.floor(spamState.rate * base * 2))
+end
 
 local arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
 
@@ -858,9 +942,35 @@ local function refreshSpamArgs()
     arg8 = false
 end
 
+local function fireBurst(remote, fn, count)
+    local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
+    local i = 0
+    while i + 8 <= count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 8
+    end
+    while i + 4 <= count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 4
+    end
+    while i < count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 1
+    end
+end
+
 local function doSpamTick()
     if not spamState.enabled then return end
-
     if not hotRemote or not fireMethod then
         if next(remotesHook.captured) ~= nil then refreshHot() end
         if not hotRemote or not fireMethod then return end
@@ -868,6 +978,15 @@ local function doSpamTick()
 
     local remote = hotRemote
     local method = fireMethod
+
+    if infiniteMode then
+        refreshPayload()
+        refreshCachedToken()
+        refreshSpamArgs()
+        local burst = unlimitedKbps and INFINITE_BURST_KB or INFINITE_BURST
+        fireBurst(remote, method, burst)
+        return
+    end
 
     local now = os.clock()
     local dt = now - spamState.lastFrame
@@ -889,32 +1008,7 @@ local function doSpamTick()
     refreshPayload()
     refreshCachedToken()
     refreshSpamArgs()
-
-    local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
-    local fn = method
-
-    local i = 0
-    while i + 8 <= count do
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        i = i + 8
-    end    while i + 4 <= count do
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        i = i + 4
-    end
-    while i < count do
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        i = i + 1
-    end
+    fireBurst(remote, method, count)
 end
 
 local refreshLoopConn = nil
@@ -936,7 +1030,6 @@ local function ensureHot()
 end
 
 refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
-
 RunService.PreSimulation:Connect(doSpamTick)
 RunService.Heartbeat:Connect(doSpamTick)
 
@@ -945,8 +1038,7 @@ local function setUnlimitedKbps(enabled)
     unlimitedKbps = enabled
     screenRefreshThreshold = enabled and 1.0 or 0.016
     payloadRefreshThreshold = 0.016
-    spamState.maxDt = enabled and 0.15 or 0.05
-    spamState.maxGuard = enabled and 60 or 20
+    refreshGuard()
     spamState.accumulator = 0
     spamState.lastFrame = os.clock()
     if enabled and not renderTickConn then
@@ -958,22 +1050,21 @@ local function setUnlimitedKbps(enabled)
 end
 
 local C = {
-    bg = Color3.fromRGB(24, 24, 28),
-    bg2 = Color3.fromRGB(30, 30, 35),
-    card = Color3.fromRGB(38, 38, 44),
-    cardHover = Color3.fromRGB(46, 46, 53),
-    stroke = Color3.fromRGB(56, 56, 64),
-    strokeAccent = Color3.fromRGB(95, 200, 130),
+    bg = Color3.fromRGB(22, 22, 26),
+    sidebar = Color3.fromRGB(18, 18, 22),
+    bg2 = Color3.fromRGB(28, 28, 33),
+    card = Color3.fromRGB(36, 36, 42),
+    cardHover = Color3.fromRGB(44, 44, 52),
+    stroke = Color3.fromRGB(52, 52, 60),
     text = Color3.fromRGB(240, 240, 245),
     textDim = Color3.fromRGB(148, 148, 158),
     textMuted = Color3.fromRGB(100, 100, 110),
     accent = Color3.fromRGB(95, 200, 130),
-    accentDim = Color3.fromRGB(70, 150, 100),
-    toggleOff = Color3.fromRGB(56, 56, 64),
+    toggleOff = Color3.fromRGB(52, 52, 60),
     knob = Color3.fromRGB(220, 220, 228),
     danger = Color3.fromRGB(225, 95, 95),
     warn = Color3.fromRGB(230, 180, 90),
-    keybg = Color3.fromRGB(20, 20, 24),
+    keybg = Color3.fromRGB(18, 18, 22),
 }
 
 local function tween(obj, props, dur)
@@ -1008,9 +1099,13 @@ ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 999
 ScreenGui.Parent = PlayerGui
 
+local PANEL_W = 460
+local PANEL_H = 340
+local SIDEBAR_W = 128
+
 local Shadow = Instance.new("Frame")
-Shadow.Size = UDim2.new(0, 288, 0, 664)
-Shadow.Position = UDim2.new(0.5, -144, 0.5, -332)
+Shadow.Size = UDim2.new(0, PANEL_W + 4, 0, PANEL_H + 4)
+Shadow.Position = UDim2.new(0.5, -(PANEL_W + 4) / 2, 0.5, -(PANEL_H + 4) / 2)
 Shadow.BackgroundColor3 = Color3.new(0, 0, 0)
 Shadow.BackgroundTransparency = 0.55
 Shadow.BorderSizePixel = 0
@@ -1018,8 +1113,8 @@ Shadow.Parent = ScreenGui
 Instance.new("UICorner", Shadow).CornerRadius = UDim.new(0, 16)
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 284, 0, 660)
-MainFrame.Position = UDim2.new(0.5, -142, 0.5, -330)
+MainFrame.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+MainFrame.Position = UDim2.new(0.5, -PANEL_W / 2, 0.5, -PANEL_H / 2)
 MainFrame.BackgroundColor3 = C.bg
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
@@ -1031,169 +1126,236 @@ frameStroke.Color = C.stroke
 frameStroke.Thickness = 1
 frameStroke.Parent = MainFrame
 
-local frameGrad = Instance.new("UIGradient")
-frameGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, C.bg2),
-    ColorSequenceKeypoint.new(1, C.bg)
-})
-frameGrad.Rotation = 90
-frameGrad.Parent = MainFrame
+local Sidebar = Instance.new("Frame")
+Sidebar.Name = "Sidebar"
+Sidebar.Size = UDim2.new(0, SIDEBAR_W, 1, 0)
+Sidebar.BackgroundColor3 = C.sidebar
+Sidebar.BorderSizePixel = 0
+Sidebar.Parent = MainFrame
 
-local TitleBar = Instance.new("Frame")
-TitleBar.Name = "TitleBar"
-TitleBar.Size = UDim2.new(1, 0, 0, 48)
-TitleBar.BackgroundTransparency = 1
-TitleBar.Parent = MainFrame
+local sidebarCorner = Instance.new("UICorner")
+sidebarCorner.CornerRadius = UDim.new(0, 14)
+sidebarCorner.Parent = Sidebar
+
+local sidebarCover = Instance.new("Frame")
+sidebarCover.Size = UDim2.new(0, 14, 1, 0)
+sidebarCover.Position = UDim2.new(1, -14, 0, 0)
+sidebarCover.BackgroundColor3 = C.sidebar
+sidebarCover.BorderSizePixel = 0
+sidebarCover.Parent = Sidebar
+
+local sidebarDivider = Instance.new("Frame")
+sidebarDivider.Size = UDim2.new(0, 1, 1, -24)
+sidebarDivider.Position = UDim2.new(1, -1, 0, 12)
+sidebarDivider.BackgroundColor3 = C.stroke
+sidebarDivider.BackgroundTransparency = 0.4
+sidebarDivider.BorderSizePixel = 0
+sidebarDivider.Parent = Sidebar
 
 local titleDot = Instance.new("Frame")
-titleDot.Size = UDim2.new(0, 8, 0, 8)
-titleDot.Position = UDim2.new(0, 18, 0.5, -4)
+titleDot.Size = UDim2.new(0, 7, 0, 7)
+titleDot.Position = UDim2.new(0, 16, 0, 26)
 titleDot.BackgroundColor3 = C.accent
 titleDot.BorderSizePixel = 0
-titleDot.Parent = TitleBar
+titleDot.Parent = Sidebar
 Instance.new("UICorner", titleDot).CornerRadius = UDim.new(1, 0)
 
 local titleGlow = Instance.new("Frame")
-titleGlow.Size = UDim2.new(0, 16, 0, 16)
-titleGlow.Position = UDim2.new(0, 14, 0.5, -8)
+titleGlow.Size = UDim2.new(0, 14, 0, 14)
+titleGlow.Position = UDim2.new(0, 12.5, 0, 22.5)
 titleGlow.BackgroundColor3 = C.accent
 titleGlow.BackgroundTransparency = 0.85
 titleGlow.BorderSizePixel = 0
-titleGlow.Parent = TitleBar
+titleGlow.Parent = Sidebar
 Instance.new("UICorner", titleGlow).CornerRadius = UDim.new(1, 0)
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -110, 1, 0)
-title.Position = UDim2.new(0, 40, 0, 0)
+title.Size = UDim2.new(1, -34, 0, 14)
+title.Position = UDim2.new(0, 30, 0, 22)
 title.BackgroundTransparency = 1
 title.Text = "HAHA.dll"
 title.TextColor3 = C.text
 title.Font = Enum.Font.GothamBold
-title.TextSize = 15
+title.TextSize = 13
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = TitleBar
+title.Parent = Sidebar
 
 local titleSub = Instance.new("TextLabel")
-titleSub.Size = UDim2.new(1, -110, 0, 12)
-titleSub.Position = UDim2.new(0, 40, 0, 28)
+titleSub.Size = UDim2.new(1, -34, 0, 10)
+titleSub.Position = UDim2.new(0, 30, 0, 36)
 titleSub.BackgroundTransparency = 1
 titleSub.Text = "by HAHA"
 titleSub.TextColor3 = C.textMuted
 titleSub.Font = Enum.Font.Gotham
-titleSub.TextSize = 9
+titleSub.TextSize = 8
 titleSub.TextXAlignment = Enum.TextXAlignment.Left
-titleSub.Parent = TitleBar
+titleSub.Parent = Sidebar
 
 local closeBtn = Instance.new("TextButton")
-closeBtn.Size = UDim2.new(0, 26, 0, 26)
-closeBtn.Position = UDim2.new(1, -38, 0.5, -13)
+closeBtn.Size = UDim2.new(0, 22, 0, 22)
+closeBtn.Position = UDim2.new(1, -30, 0, 22)
 closeBtn.BackgroundColor3 = C.card
 closeBtn.BorderSizePixel = 0
 closeBtn.Text = "×"
 closeBtn.TextColor3 = C.textDim
 closeBtn.Font = Enum.Font.GothamBold
-closeBtn.TextSize = 20
+closeBtn.TextSize = 16
 closeBtn.AutoButtonColor = false
-closeBtn.Parent = TitleBar
-Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 7)
+closeBtn.Parent = Sidebar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
 
-local divider = Instance.new("Frame")
-divider.Size = UDim2.new(1, -36, 0, 1)
-divider.Position = UDim2.new(0, 18, 0, 48)
-divider.BackgroundColor3 = C.stroke
-divider.BackgroundTransparency = 0.5
-divider.BorderSizePixel = 0
-divider.Parent = MainFrame
+local TabList = Instance.new("Frame")
+TabList.Size = UDim2.new(1, -16, 1, -90)
+TabList.Position = UDim2.new(0, 8, 0, 62)
+TabList.BackgroundTransparency = 1
+TabList.Parent = Sidebar
+local tabListLayout = Instance.new("UIListLayout")
+tabListLayout.Padding = UDim.new(0, 3)
+tabListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabListLayout.Parent = TabList
 
-local function makeSectionLabel(y, text)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -36, 0, 14)
-    lbl.Position = UDim2.new(0, 18, 0, y)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = text:upper()
-    lbl.TextColor3 = C.textMuted
-    lbl.Font = Enum.Font.GothamBold
-    lbl.TextSize = 10
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Parent = MainFrame
-    return lbl
-end
+local Content = Instance.new("Frame")
+Content.Name = "Content"
+Content.Size = UDim2.new(1, -SIDEBAR_W, 1, 0)
+Content.Position = UDim2.new(0, SIDEBAR_W, 0, 0)
+Content.BackgroundTransparency = 1
+Content.Parent = MainFrame
 
-local function makeKeybindBox(row, keybindsTable, keyName2)
-    local box = Instance.new("TextBox")
-    box.Size = UDim2.new(0, 56, 0, 22)
-    box.Position = UDim2.new(0, 104, 0.5, -11)
-    box.BackgroundColor3 = C.keybg
-    box.BorderSizePixel = 0
-    box.Text = keyName(keybindsTable[keyName2])
-    box.TextColor3 = C.accent
-    box.Font = Enum.Font.GothamBold
-    box.TextSize = 11
-    box.TextXAlignment = Enum.TextXAlignment.Center
-    box.ClearTextOnFocus = false
-    box.Parent = row
-    pcall(function() box.TextEditable = false end)
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = C.stroke
-    stroke.Thickness = 1
-    stroke.Parent = box
-    box.Focused:Connect(function()
-        armingBox = box
-        armingKey = { table = keybindsTable, name = keyName2 }
-        box.Text = "..."
-        stroke.Color = C.accent
-        stroke.Thickness = 2
-    end)
-    box.FocusLost:Connect(function()
-        if armingBox == box then
-            armingBox = nil
-            armingKey = nil
-        end
-        box.Text = keyName(keybindsTable[keyName2])
-        stroke.Color = C.stroke
-        stroke.Thickness = 1
-    end)
-    return box
-end
+local contentHeader = Instance.new("Frame")
+contentHeader.Size = UDim2.new(1, -32, 0, 52)
+contentHeader.Position = UDim2.new(0, 16, 0, 0)
+contentHeader.BackgroundTransparency = 1
+contentHeader.Parent = Content
 
-local function makeToggleRow(yPos, label, onChanged, keybindTarget)
+local pageTitle = Instance.new("TextLabel")
+pageTitle.Size = UDim2.new(1, 0, 0, 20)
+pageTitle.Position = UDim2.new(0, 0, 0, 14)
+pageTitle.BackgroundTransparency = 1
+pageTitle.Text = "Combat"
+pageTitle.TextColor3 = C.text
+pageTitle.Font = Enum.Font.GothamBold
+pageTitle.TextSize = 17
+pageTitle.TextXAlignment = Enum.TextXAlignment.Left
+pageTitle.Parent = contentHeader
+
+local pageSub = Instance.new("TextLabel")
+pageSub.Size = UDim2.new(1, 0, 0, 12)
+pageSub.Position = UDim2.new(0, 0, 0, 34)
+pageSub.BackgroundTransparency = 1
+pageSub.Text = "Toggles and automation"
+pageSub.TextColor3 = C.textMuted
+pageSub.Font = Enum.Font.Gotham
+pageSub.TextSize = 10
+pageSub.TextXAlignment = Enum.TextXAlignment.Left
+pageSub.Parent = contentHeader
+
+local headerDivider = Instance.new("Frame")
+headerDivider.Size = UDim2.new(1, -32, 0, 1)
+headerDivider.Position = UDim2.new(0, 16, 0, 52)
+headerDivider.BackgroundColor3 = C.stroke
+headerDivider.BackgroundTransparency = 0.5
+headerDivider.BorderSizePixel = 0
+headerDivider.Parent = Content
+
+local PageContainer = Instance.new("Frame")
+PageContainer.Size = UDim2.new(1, -24, 1, -66)
+PageContainer.Position = UDim2.new(0, 12, 0, 62)
+PageContainer.BackgroundTransparency = 1
+PageContainer.ClipsDescendants = true
+PageContainer.Parent = Content
+
+local PageScroll = Instance.new("ScrollingFrame")
+PageScroll.Size = UDim2.new(1, 0, 1, 0)
+PageScroll.BackgroundTransparency = 1
+PageScroll.BorderSizePixel = 0
+PageScroll.ScrollBarThickness = 3
+PageScroll.ScrollBarImageColor3 = C.stroke
+PageScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+PageScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+PageScroll.Parent = PageContainer
+
+local pageLayout = Instance.new("UIListLayout")
+pageLayout.Padding = UDim.new(0, 8)
+pageLayout.SortOrder = Enum.SortOrder.LayoutOrder
+pageLayout.Parent = PageScroll
+
+local pagePadding = Instance.new("UIPadding")
+pagePadding.PaddingTop = UDim.new(0, 4)
+pagePadding.PaddingBottom = UDim.new(0, 12)
+pagePadding.Parent = PageScroll
+
+local pages = {}
+local currentTab = nil
+
+local function makeToggle(parent, label, onChanged, keybindTarget)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, -36, 0, 46)
-    row.Position = UDim2.new(0, 18, 0, yPos)
+    row.Size = UDim2.new(1, -8, 0, 42)
     row.BackgroundColor3 = C.card
     row.BorderSizePixel = 0
     row.Text = ""
     row.AutoButtonColor = false
-    row.Parent = MainFrame
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 10)
+    row.Parent = parent
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 9)
 
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, keybindTarget and -148 or -90, 1, 0)
+    lbl.Size = UDim2.new(1, keybindTarget and -132 or -80, 1, 0)
     lbl.Position = UDim2.new(0, 14, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = label
     lbl.TextColor3 = C.text
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = keybindTarget and 13 or 14
+    lbl.TextSize = 13
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Parent = row
 
     if keybindTarget then
-        makeKeybindBox(row, keybindTarget.table, keybindTarget.name)
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.new(0, 54, 0, 22)
+        box.Position = UDim2.new(0, 96, 0.5, -11)
+        box.BackgroundColor3 = C.keybg
+        box.BorderSizePixel = 0
+        box.Text = keyName(keybindTarget.table[keybindTarget.name])
+        box.TextColor3 = C.accent
+        box.Font = Enum.Font.GothamBold
+        box.TextSize = 11
+        box.TextXAlignment = Enum.TextXAlignment.Center
+        box.ClearTextOnFocus = false
+        box.Parent = row
+        pcall(function() box.TextEditable = false end)
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = C.stroke
+        stroke.Thickness = 1
+        stroke.Parent = box
+        box.Focused:Connect(function()
+            armingBox = box
+            armingKey = keybindTarget
+            box.Text = "..."
+            stroke.Color = C.accent
+            stroke.Thickness = 2
+        end)
+        box.FocusLost:Connect(function()
+            if armingBox == box then
+                armingBox = nil
+                armingKey = nil
+            end
+            box.Text = keyName(keybindTarget.table[keybindTarget.name])
+            stroke.Color = C.stroke
+            stroke.Thickness = 1
+        end)
     end
 
     local bg = Instance.new("Frame")
-    bg.Size = UDim2.new(0, 40, 0, 22)
-    bg.Position = UDim2.new(1, -54, 0.5, -11)
+    bg.Size = UDim2.new(0, 38, 0, 20)
+    bg.Position = UDim2.new(1, -52, 0.5, -10)
     bg.BackgroundColor3 = C.toggleOff
     bg.BorderSizePixel = 0
     bg.Parent = row
     Instance.new("UICorner", bg).CornerRadius = UDim.new(1, 0)
 
     local knob = Instance.new("Frame")
-    knob.Size = UDim2.new(0, 16, 0, 16)
-    knob.Position = UDim2.new(0, 3, 0.5, -8)
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.Position = UDim2.new(0, 3, 0.5, -7)
     knob.BackgroundColor3 = C.knob
     knob.BorderSizePixel = 0
     knob.Parent = bg
@@ -1203,9 +1365,9 @@ local function makeToggleRow(yPos, label, onChanged, keybindTarget)
     local function setState(s)
         state = s
         tween(knob, {
-            Position = s and UDim2.new(0, 21, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
-        }, 0.2)
-        TweenService:Create(bg, TweenInfo.new(0.2), {
+            Position = s and UDim2.new(0, 21, 0.5, -7) or UDim2.new(0, 3, 0.5, -7)
+        }, 0.18)
+        TweenService:Create(bg, TweenInfo.new(0.18), {
             BackgroundColor3 = s and C.accent or C.toggleOff
         }):Play()
         if onChanged then onChanged(s) end
@@ -1225,18 +1387,17 @@ local function makeToggleRow(yPos, label, onChanged, keybindTarget)
     return { set = setState, get = function() return state end }
 end
 
-local function makeSlider(yPos, label, min, max, initial, onChanged)
+local function makeSlider(parent, label, min, max, initial, onChanged)
     local container = Instance.new("Frame")
-    container.Size = UDim2.new(1, -36, 0, 62)
-    container.Position = UDim2.new(0, 18, 0, yPos)
+    container.Size = UDim2.new(1, -8, 0, 58)
     container.BackgroundColor3 = C.card
     container.BorderSizePixel = 0
-    container.Parent = MainFrame
-    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 10)
+    container.Parent = parent
+    Instance.new("UICorner", container).CornerRadius = UDim.new(0, 9)
 
     local lbl = Instance.new("TextLabel")
     lbl.Size = UDim2.new(0.6, 0, 0, 16)
-    lbl.Position = UDim2.new(0, 14, 0, 6)
+    lbl.Position = UDim2.new(0, 14, 0, 5)
     lbl.BackgroundTransparency = 1
     lbl.Text = label
     lbl.TextColor3 = C.text
@@ -1247,7 +1408,7 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 
     local valLabel = Instance.new("TextLabel")
     valLabel.Size = UDim2.new(0.35, 0, 0, 16)
-    valLabel.Position = UDim2.new(0.65, 0, 0, 6)
+    valLabel.Position = UDim2.new(0.65, 0, 0, 5)
     valLabel.BackgroundTransparency = 1
     valLabel.Text = tostring(initial)
     valLabel.TextColor3 = C.accent
@@ -1258,7 +1419,7 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 
     local sub = Instance.new("TextLabel")
     sub.Size = UDim2.new(1, -28, 0, 12)
-    sub.Position = UDim2.new(0, 14, 0, 24)
+    sub.Position = UDim2.new(0, 14, 0, 22)
     sub.BackgroundTransparency = 1
     sub.Text = ""
     sub.TextColor3 = C.textMuted
@@ -1269,7 +1430,7 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
 
     local track = Instance.new("Frame")
     track.Size = UDim2.new(1, -28, 0, 6)
-    track.Position = UDim2.new(0, 14, 1, -16)
+    track.Position = UDim2.new(0, 14, 1, -14)
     track.BackgroundColor3 = C.toggleOff
     track.BorderSizePixel = 0
     track.Parent = container
@@ -1335,12 +1496,98 @@ local function makeSlider(yPos, label, min, max, initial, onChanged)
     return { set = setValue, get = function() return value end, sub = sub }
 end
 
-local AutoParry = false
-local spamToggle, triggerToggle, orbitToggle
+local function makeTab(name, subtitle, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 34)
+    btn.BackgroundColor3 = C.card
+    btn.BackgroundTransparency = 1
+    btn.BorderSizePixel = 0
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.LayoutOrder = order
+    btn.Parent = TabList
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
 
-makeSectionLabel(58, "Combat")
-spamToggle = makeToggleRow(74, "Auto parry", function(s) AutoParry = s end)
-spamToggle = makeToggleRow(124, "Manual spam", function(s)
+    local accentBar = Instance.new("Frame")
+    accentBar.Size = UDim2.new(0, 3, 0, 18)
+    accentBar.Position = UDim2.new(0, 0, 0.5, -9)
+    accentBar.BackgroundColor3 = C.accent
+    accentBar.BorderSizePixel = 0
+    accentBar.BackgroundTransparency = 1
+    accentBar.Parent = btn
+    Instance.new("UICorner", accentBar).CornerRadius = UDim.new(1, 0)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -24, 1, 0)
+    lbl.Position = UDim2.new(0, 16, 0, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = name
+    lbl.TextColor3 = C.textDim
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = btn
+
+    local page = Instance.new("Frame")
+    page.Name = name .. "Page"
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.Visible = false
+    page.Parent = PageScroll
+
+    local inner = Instance.new("Frame")
+    inner.Size = UDim2.new(1, 0, 0, 0)
+    inner.BackgroundTransparency = 1
+    inner.AutomaticSize = Enum.AutomaticSize.Y
+    inner.Parent = page
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 8)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = inner
+
+    pages[name] = { page = page, inner = inner, subtitle = subtitle, button = btn, accent = accentBar, label = lbl }
+
+    btn.MouseEnter:Connect(function()
+        if currentTab ~= name then
+            tween(btn, { BackgroundColor3 = C.card, BackgroundTransparency = 0.5 })
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        if currentTab ~= name then
+            tween(btn, { BackgroundTransparency = 1 })
+        end
+    end)
+    btn.MouseButton1Click:Connect(function()
+        for tabName, tab in pairs(pages) do
+            tab.page.Visible = false
+            tab.accent.BackgroundTransparency = 1
+            tab.label.TextColor3 = C.textDim
+            tab.button.BackgroundTransparency = 1
+        end
+        pages[name].page.Visible = true
+        pages[name].accent.BackgroundTransparency = 0
+        pages[name].label.TextColor3 = C.text
+        pages[name].button.BackgroundColor3 = C.card
+        pages[name].button.BackgroundTransparency = 0
+        pageTitle.Text = name
+        pageSub.Text = subtitle
+        currentTab = name
+    end)
+
+    return pages[name]
+end
+
+local combatTab = makeTab("Combat", "Toggles and automation", 1)
+local movementTab = makeTab("Movement", "Ball orbit", 2)
+local perfTab = makeTab("Performance", "Lag reduction & burst control", 3)
+local tuningTab = makeTab("Tuning", "Precision control", 4)
+local statsTab = makeTab("Stats", "Live telemetry", 5)
+
+local AutoParry = false
+local spamToggle, triggerToggle, orbitToggle, infiniteToggle
+
+makeToggle(combatTab.inner, "Auto parry", function(s) AutoParry = s end)
+spamToggle = makeToggle(combatTab.inner, "Manual spam", function(s)
     spamState.enabled = s
     spamState.accumulator = 0
     spamState.lastFrame = os.clock()
@@ -1351,7 +1598,7 @@ spamToggle = makeToggleRow(124, "Manual spam", function(s)
         end
     end
 end, { table = keybinds, name = "spam" })
-triggerToggle = makeToggleRow(174, "Triggerbot", function(s)
+triggerToggle = makeToggle(combatTab.inner, "Triggerbot", function(s)
     triggerEnabled = s
     if s then
         for _, ball in ipairs(getRealBalls()) do
@@ -1360,34 +1607,42 @@ triggerToggle = makeToggleRow(174, "Triggerbot", function(s)
     end
 end, { table = keybinds, name = "trigger" })
 
-makeSectionLabel(232, "Movement")
-orbitToggle = makeToggleRow(248, "Ball Orbit", function(s)
+orbitToggle = makeToggle(movementTab.inner, "Ball Orbit", function(s)
     orbit.enabled = s
     orbit.angle = 0
     orbit.lastTick = os.clock()
 end, { table = keybinds, name = "orbit" })
 
-makeSectionLabel(306, "Performance")
-makeToggleRow(322, "Unlimited KBPS", function(s) setUnlimitedKbps(s) end)
-makeToggleRow(372, "No Render", function(s)
+makeToggle(perfTab.inner, "Unlimited KBPS", function(s) setUnlimitedKbps(s) end)
+makeToggle(perfTab.inner, "No Render", function(s)
     if s then enableNoRender() else disableNoRender() end
 end)
+infiniteToggle = makeToggle(perfTab.inner, "Infinite spam", function(s)
+    infiniteMode = s
+    if s then
+        if next(remotesHook.captured) ~= nil then refreshHot() end
+        if not refreshLoopConn then
+            refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
+        end
+    end
+end)
 
-makeSectionLabel(430, "Tuning")
-makeSlider(446, "Spam rate (/s)", 100, 500, spamState.rate, function(v) spamState.rate = v end)
-local accuracySlider = makeSlider(512, "Accuracy", 40, 100, CONFIG.Accuracy, function(v) CONFIG.Accuracy = v end)
-makeToggleRow(578, "Auto accuracy", function(s)
+makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 1000, spamState.rate, function(v)
+    spamState.rate = v
+    refreshGuard()
+end)
+local accuracySlider = makeSlider(tuningTab.inner, "Accuracy", 40, 100, CONFIG.Accuracy, function(v) CONFIG.Accuracy = v end)
+makeToggle(tuningTab.inner, "Auto accuracy", function(s)
     CONFIG.AccuracyMode = s and "auto" or "manual"
     lastAccuracyCalc = 0
 end)
 
 local StatsCard = Instance.new("Frame")
-StatsCard.Size = UDim2.new(1, -36, 0, 56)
-StatsCard.Position = UDim2.new(0, 18, 0, 630)
+StatsCard.Size = UDim2.new(1, -8, 0, 100)
 StatsCard.BackgroundColor3 = C.card
 StatsCard.BorderSizePixel = 0
-StatsCard.Parent = MainFrame
-Instance.new("UICorner", StatsCard).CornerRadius = UDim.new(0, 10)
+StatsCard.Parent = statsTab.inner
+Instance.new("UICorner", StatsCard).CornerRadius = UDim.new(0, 9)
 
 local statsGrad = Instance.new("UIGradient")
 statsGrad.Color = ColorSequence.new({
@@ -1398,8 +1653,8 @@ statsGrad.Rotation = 90
 statsGrad.Parent = StatsCard
 
 local VelocityLabel = Instance.new("TextLabel")
-VelocityLabel.Size = UDim2.new(0.5, 0, 0.5, 0)
-VelocityLabel.Position = UDim2.new(0, 16, 0, 6)
+VelocityLabel.Size = UDim2.new(0.5, 0, 0, 22)
+VelocityLabel.Position = UDim2.new(0, 16, 0, 12)
 VelocityLabel.BackgroundTransparency = 1
 VelocityLabel.Text = "Ball velocity"
 VelocityLabel.TextColor3 = C.textDim
@@ -1409,19 +1664,19 @@ VelocityLabel.TextXAlignment = Enum.TextXAlignment.Left
 VelocityLabel.Parent = StatsCard
 
 local VelocityValue = Instance.new("TextLabel")
-VelocityValue.Size = UDim2.new(0.5, 0, 0.5, 0)
-VelocityValue.Position = UDim2.new(0.5, -16, 0, 6)
+VelocityValue.Size = UDim2.new(0.5, 0, 0, 22)
+VelocityValue.Position = UDim2.new(0.5, -16, 0, 12)
 VelocityValue.BackgroundTransparency = 1
 VelocityValue.Text = "--"
 VelocityValue.TextColor3 = C.text
 VelocityValue.Font = Enum.Font.GothamBold
-VelocityValue.TextSize = 13
+VelocityValue.TextSize = 14
 VelocityValue.TextXAlignment = Enum.TextXAlignment.Right
 VelocityValue.Parent = StatsCard
 
 local PingLabel = Instance.new("TextLabel")
-PingLabel.Size = UDim2.new(0.5, 0, 0.5, 0)
-PingLabel.Position = UDim2.new(0, 16, 0.5, 6)
+PingLabel.Size = UDim2.new(0.5, 0, 0, 22)
+PingLabel.Position = UDim2.new(0, 16, 0, 40)
 PingLabel.BackgroundTransparency = 1
 PingLabel.Text = "Ping"
 PingLabel.TextColor3 = C.textDim
@@ -1431,25 +1686,55 @@ PingLabel.TextXAlignment = Enum.TextXAlignment.Left
 PingLabel.Parent = StatsCard
 
 local PingValue = Instance.new("TextLabel")
-PingValue.Size = UDim2.new(0.5, 0, 0.5, 0)
-PingValue.Position = UDim2.new(0.5, -16, 0.5, 6)
+PingValue.Size = UDim2.new(0.5, 0, 0, 22)
+PingValue.Position = UDim2.new(0.5, -16, 0, 40)
 PingValue.BackgroundTransparency = 1
 PingValue.Text = "--"
 PingValue.TextColor3 = C.text
 PingValue.Font = Enum.Font.GothamBold
-PingValue.TextSize = 13
+PingValue.TextSize = 14
 PingValue.TextXAlignment = Enum.TextXAlignment.Right
 PingValue.Parent = StatsCard
+
+local AccLabel = Instance.new("TextLabel")
+AccLabel.Size = UDim2.new(0.5, 0, 0, 22)
+AccLabel.Position = UDim2.new(0, 16, 0, 68)
+AccLabel.BackgroundTransparency = 1
+AccLabel.Text = "Effective accuracy"
+AccLabel.TextColor3 = C.textDim
+AccLabel.Font = Enum.Font.Gotham
+AccLabel.TextSize = 11
+AccLabel.TextXAlignment = Enum.TextXAlignment.Left
+AccLabel.Parent = StatsCard
+
+local AccValue = Instance.new("TextLabel")
+AccValue.Size = UDim2.new(0.5, 0, 0, 22)
+AccValue.Position = UDim2.new(0.5, -16, 0, 68)
+AccValue.BackgroundTransparency = 1
+AccValue.Text = "--"
+AccValue.TextColor3 = C.text
+AccValue.Font = Enum.Font.GothamBold
+AccValue.TextSize = 14
+AccValue.TextXAlignment = Enum.TextXAlignment.Right
+AccValue.Parent = StatsCard
+
+currentTab = "Combat"
+pages["Combat"].page.Visible = true
+pages["Combat"].accent.BackgroundTransparency = 0
+pages["Combat"].label.TextColor3 = C.text
+pages["Combat"].button.BackgroundColor3 = C.card
+pages["Combat"].button.BackgroundTransparency = 0
 
 closeBtn.MouseEnter:Connect(function()
     tween(closeBtn, { BackgroundColor3 = C.danger, TextColor3 = Color3.fromRGB(255, 255, 255) }, 0.12)
 end)
-
 closeBtn.MouseLeave:Connect(function()
     tween(closeBtn, { BackgroundColor3 = C.card, TextColor3 = C.textDim }, 0.12)
 end)
 
-TitleBar.InputBegan:Connect(function(input)
+local dragStartX, dragStartY, startFramePos, startShadowPos
+
+Sidebar.InputBegan:Connect(function(input)
     if input.UserInputType ~= Enum.UserInputType.MouseButton1
         and input.UserInputType ~= Enum.UserInputType.Touch then return end
     local p = input.Position
@@ -1457,12 +1742,12 @@ TitleBar.InputBegan:Connect(function(input)
     local cSize = closeBtn.AbsoluteSize
     if p.X >= cPos.X and p.X <= cPos.X + cSize.X
         and p.Y >= cPos.Y and p.Y <= cPos.Y + cSize.Y then return end
-    local startX, startY = p.X, p.Y
-    local startFramePos = MainFrame.Position
-    local startShadowPos = Shadow.Position
+    dragStartX, dragStartY = p.X, p.Y
+    startFramePos = MainFrame.Position
+    startShadowPos = Shadow.Position
     activeDrag = {
         onMove = function(x, y)
-            local dx, dy = x - startX, y - startY
+            local dx, dy = x - dragStartX, y - dragStartY
             MainFrame.Position = UDim2.new(
                 startFramePos.X.Scale, startFramePos.X.Offset + dx,
                 startFramePos.Y.Scale, startFramePos.Y.Offset + dy
@@ -1555,16 +1840,14 @@ RunService.PostSimulation:Connect(function()
     checkParry()
 end)
 
-local function orbitHeartbeat()
+RunService.Heartbeat:Connect(function()
     if not orbit.enabled then return end
     local now = os.clock()
     local dt = now - orbit.lastTick
     orbit.lastTick = now
     if dt > 0.1 then dt = 0.1 end
     updateOrbit(dt)
-end
-
-RunService.Heartbeat:Connect(orbitHeartbeat)
+end)
 
 local alive = true
 task.spawn(function()
@@ -1591,8 +1874,11 @@ task.spawn(function()
         PingValue.TextColor3 = ping > 200 and C.warn or C.text
         if CONFIG.AccuracyMode == "auto" then
             local eff = getEffectiveAccuracy()
+            local aText = string.format("%.0f%%", eff)
+            if AccValue.Text ~= aText then AccValue.Text = aText end
             accuracySlider.sub.Text = string.format("auto | eff: %.0f%% | j: %.0f", eff, pingJitter)
         else
+            if AccValue.Text ~= "manual" then AccValue.Text = "manual" end
             accuracySlider.sub.Text = "manual"
         end
         task.wait(0.05)
@@ -1637,7 +1923,6 @@ end
 MiniButton.MouseEnter:Connect(function()
     tween(MiniButton, { BackgroundColor3 = C.cardHover }, 0.12)
 end)
-
 MiniButton.MouseLeave:Connect(function()
     tween(MiniButton, { BackgroundColor3 = C.bg }, 0.12)
 end)
@@ -1668,6 +1953,7 @@ MiniButton.MouseButton2Click:Connect(function()
     spamState.enabled = false
     triggerEnabled = false
     orbit.enabled = false
+    infiniteMode = false
     if renderTickConn then renderTickConn:Disconnect() end
     if refreshLoopConn then refreshLoopConn:Disconnect() end
     if noRender.enabled then disableNoRender() end
