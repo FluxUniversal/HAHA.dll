@@ -23,14 +23,14 @@ local S = {
     CONFIG = { FireArg = 0.5, Accuracy = 85, AccuracyMode = "auto" },
     keybinds = { spam = Enum.KeyCode.X, trigger = Enum.KeyCode.C, orbit = Enum.KeyCode.O },
     orbit = { enabled = false, angle = 0, radius = 12, speed = 6, lastTick = os.clock() },
+    rageOrbit = { enabled = false, cooldown = 0, studs = 23 },
     spamState = { enabled = false, rate = 100, accumulator = 0, lastFrame = os.clock(), maxDt = 0.05, maxGuard = 20 },
     remotesHook = { mt = {}, orig = {}, captured = {}, tokenFn = nil, firstSignal = nil, done = false, descConn = nil },
     noRender = {
         enabled = false,
         saved = setmetatable({}, {__mode = "k"}),
-        enabledHooks = setmetatable({}, {__mode = "k"}),
-        count = 0,
-        sweepConn = nil,
+        descConn = nil,
+        lightingConn = nil,
     },
     armingBox = nil,
     armingKey = nil,
@@ -88,6 +88,7 @@ local S = {
     spamToggle = nil,
     triggerToggle = nil,
     orbitToggle = nil,
+    rageOrbitToggle = nil,
     infiniteToggle = nil,
 }
 
@@ -146,9 +147,13 @@ local function getAccuracyMultiplier()
     return 100 / S.cachedEffectiveAccuracy
 end
 
-local function getOrbitHRP()
+local function getLocalHRP()
     local char = LocalPlayer.Character
     return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function getOrbitHRP()
+    return getLocalHRP()
 end
 
 local function getOrbitBall()
@@ -192,6 +197,59 @@ local function updateOrbit(dt)
         math.sin(S.orbit.angle) * S.orbit.radius
     )
     hrp.CFrame = CFrame.new(center + offset)
+end
+
+local function getRageOrbitBall()
+    local hrp = getLocalHRP()
+    if not hrp then return nil end
+    local folder = ws:FindFirstChild("Balls")
+    if not folder then return nil end
+    local closest, dist = nil, math.huge
+    for _, v in ipairs(folder:GetChildren()) do
+        if v:IsA("BasePart") then
+            local d = (hrp.Position - v.Position).Magnitude
+            if d < dist then
+                dist = d
+                closest = v
+            end
+        end
+    end
+    return closest
+end
+
+local function getRageOrbitOffset()
+    local angle = math.random() * math.pi * 2
+    return Vector3.new(math.cos(angle) * S.rageOrbit.studs, 0, math.sin(angle) * S.rageOrbit.studs)
+end
+
+local function rageCurveSlide(target)
+    local hrp = getLocalHRP()
+    if not hrp then return end
+    local start = hrp.Position
+    local mid = (start + target) / 2
+    local dir = target - start
+    if dir.Magnitude == 0 then return end
+    dir = dir.Unit
+    local side = Vector3.new(-dir.Z, 0, dir.X)
+    mid = mid + side * math.random(5, 15)
+    local steps = 3
+    local spin = 0
+    for i = 1, steps do
+        local hrp2 = getLocalHRP()
+        if not hrp2 then return end
+        local t = i / steps
+        local pos = (1 - t) ^ 2 * start + 2 * (1 - t) * t * mid + t ^ 2 * target
+        spin += 60
+        hrp2.CFrame = CFrame.new(pos) * CFrame.Angles(0, math.rad(spin), 0)
+        task.wait(0.001)
+    end
+end
+
+local function rageOrbitTick()
+    if not S.rageOrbit.enabled then return end
+    local ball = getRageOrbitBall()
+    if not ball then return end
+    rageCurveSlide(ball.Position + getRageOrbitOffset())
 end
 
 local function validArgs(args)
@@ -596,102 +654,8 @@ local function saveProp(inst, prop)
         S.noRender.saved[inst] = s
     end
     if s[prop] == nil then
-        local ok, v = pcall(function() return inst[prop] end)
-        if ok then
-            s[prop] = v
-            S.noRender.count = S.noRender.count + 1
-        end
+        s[prop] = inst[prop]
     end
-end
-
-local function killProp(inst, prop, killer)
-    local ok, cur = pcall(function() return inst[prop] end)
-    if not ok then return end
-    if cur == killer then return end
-    saveProp(inst, prop)
-    pcall(function() inst[prop] = killer end)
-end
-
-local function killEnabled(inst)
-    killProp(inst, "Enabled", false)
-    if not S.noRender.enabledHooks[inst] then
-        local conn = inst:GetPropertyChangedSignal("Enabled"):Connect(function()
-            if S.noRender.enabled then
-                pcall(function()
-                    if inst.Enabled then
-                        saveProp(inst, "Enabled")
-                        inst.Enabled = false
-                    end
-                end)
-            end
-        end)
-        S.noRender.enabledHooks[inst] = conn
-    end
-end
-
-local function killTransparency(inst)
-    killProp(inst, "Transparency", 1)
-end
-
-local function killVisible(inst)
-    killProp(inst, "Visible", false)
-end
-
-local function killShadow(inst)
-    killProp(inst, "CastShadow", false)
-end
-
-local function killImage(inst)
-    killProp(inst, "Image", "")
-    killProp(inst, "ImageTransparency", 1)
-end
-
-local function killMeshTexture(inst)
-    killProp(inst, "Texture", "")
-end
-
-local function killSound(inst)
-    killProp(inst, "Volume", 0)
-    pcall(function() inst:Stop() end)
-    if not S.noRender.enabledHooks[inst] then
-        local conn = inst.Played:Connect(function()
-            if S.noRender.enabled then
-                pcall(function() inst:Stop() end)
-            end
-        end)
-        S.noRender.enabledHooks[inst] = conn
-    end
-end
-
-local function killPostFX(inst)
-    killProp(inst, "Enabled", false)
-end
-
-local function killAtmosphere(inst)
-    killProp(inst, "Density", 0)
-    killProp(inst, "Haze", 0)
-    killProp(inst, "Glare", 0)
-end
-
-local function killClouds(inst)
-    killProp(inst, "Cover", 0)
-    killProp(inst, "Density", 0)
-end
-
-local function killSky(inst)
-    for _, p in ipairs({
-        "SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp",
-        "SunTextureId","MoonTextureId"
-    }) do
-        killProp(inst, p, "")
-    end
-    killProp(inst, "StarCount", 0)
-end
-
-local function killTerrain(terrain)
-    killProp(terrain, "WaterWaveSize", 0)
-    killProp(terrain, "WaterWaveSpeed", 0)
-    killProp(terrain, "WaterReflectance", 0)
 end
 
 local function killEffect(inst)
@@ -699,86 +663,76 @@ local function killEffect(inst)
     if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
         or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
         or cls == "Explosion" or cls == "Highlight" then
-        killEnabled(inst)
-        if cls == "ParticleEmitter" or cls == "Fire" or cls == "Smoke" then
-            killProp(inst, "Rate", 0)
-            killProp(inst, "Brightness", 0)
-        end
-        if cls == "Trail" or cls == "Beam" then
-            killProp(inst, "Transparency", NumberSequence.new(1))
-            killProp(inst, "LightEmission", 0)
-        end
-        if cls == "Highlight" then
-            killProp(inst, "FillTransparency", 1)
-            killProp(inst, "OutlineTransparency", 1)
+        if inst.Enabled then
+            saveProp(inst, "Enabled")
+            inst.Enabled = false
         end
     elseif cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight" then
-        killEnabled(inst)
-        killProp(inst, "Brightness", 0)
-        killProp(inst, "Range", 0)
+        if inst.Enabled then
+            saveProp(inst, "Enabled")
+            inst.Enabled = false
+        end
+        if inst.Brightness ~= 0 then
+            saveProp(inst, "Brightness")
+            inst.Brightness = 0
+        end
     elseif cls == "Decal" or cls == "Texture" then
-        killTransparency(inst)
-        if cls == "Texture" then
-            killMeshTexture(inst)
+        if inst.Transparency ~= 1 then
+            saveProp(inst, "Transparency")
+            inst.Transparency = 1
         end
     elseif cls == "SurfaceGui" or cls == "BillboardGui" then
-        killEnabled(inst)
+        if inst.Enabled then
+            saveProp(inst, "Enabled")
+            inst.Enabled = false
+        end
     elseif cls == "ViewportFrame" then
-        killVisible(inst)
+        if inst.Visible then
+            saveProp(inst, "Visible")
+            inst.Visible = false
+        end
     elseif cls == "Sound" or cls == "SoundGroup" then
-        killSound(inst)
+        if inst.Volume ~= 0 then
+            saveProp(inst, "Volume")
+            inst.Volume = 0
+        end
+        if inst.IsPlaying then pcall(function() inst:Stop() end) end
     end
 end
 
 local function killEnv(inst)
     if inst:IsA("PostEffect") then
-        killPostFX(inst)
+        if inst.Enabled then
+            saveProp(inst, "Enabled")
+            inst.Enabled = false
+        end
     elseif inst:IsA("Atmosphere") then
-        killAtmosphere(inst)
+        if inst.Density ~= 0 then
+            saveProp(inst, "Density")
+            inst.Density = 0
+        end
     elseif inst:IsA("Clouds") then
-        killClouds(inst)
+        if inst.Cover ~= 0 then
+            saveProp(inst, "Cover")
+            inst.Cover = 0
+        end
     elseif inst:IsA("Sky") then
-        killSky(inst)
-    end
-end
-
-local function killAllInRoot(root, skipPlayerGui)
-    for _, d in ipairs(root:GetDescendants()) do
-        if d:IsA("BasePart") then
-            killShadow(d)
-            if d:FindFirstAncestorWhichIsA("Accessory") then
-                killTransparency(d)
+        for _, p in ipairs({"SkyboxBk","SkyboxDn","SkyboxFt","SkyboxLf","SkyboxRt","SkyboxUp","SunTextureId","MoonTextureId"}) do
+            if inst[p] ~= "" then
+                saveProp(inst, p)
+                inst[p] = ""
             end
-        end
-        if skipPlayerGui and d:IsDescendantOf(PlayerGui) then
-            continue
-        end
-        local cls = d.ClassName
-        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
-            or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
-            or cls == "Explosion" or cls == "Highlight"
-            or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
-            or cls == "Decal" or cls == "Texture"
-            or cls == "SurfaceGui" or cls == "BillboardGui" or cls == "ViewportFrame"
-            or cls == "Sound" or cls == "SoundGroup" then
-            killEffect(d)
-        elseif cls == "ImageLabel" or cls == "ImageButton" then
-            killImage(d)
         end
     end
 end
 
 local function applyNoRender()
-    S.noRender.count = 0
     local s = S.noRender.saved[Lighting]
     if not s then s = {}; S.noRender.saved[Lighting] = s end
     s.Ambient = Lighting.Ambient
     s.OutdoorAmbient = Lighting.OutdoorAmbient
     s.Brightness = Lighting.Brightness
     s.GlobalShadows = Lighting.GlobalShadows
-    pcall(function() s.EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale end)
-    pcall(function() s.EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale end)
-    pcall(function() s.ShadowSoftness = Lighting.ShadowSoftness end)
     s.FogEnd = Lighting.FogEnd
     s.FogStart = Lighting.FogStart
     s.ClockTime = Lighting.ClockTime
@@ -787,9 +741,6 @@ local function applyNoRender()
     Lighting.OutdoorAmbient = Color3.fromRGB(180, 180, 180)
     Lighting.Brightness = 2
     Lighting.GlobalShadows = false
-    pcall(function() Lighting.EnvironmentDiffuseScale = 0.5 end)
-    pcall(function() Lighting.EnvironmentSpecularScale = 0.5 end)
-    pcall(function() Lighting.ShadowSoftness = 0 end)
     Lighting.FogEnd = 1e10
     Lighting.FogStart = 0
     Lighting.ClockTime = 12
@@ -800,101 +751,107 @@ local function applyNoRender()
 
     local terrain = ws:FindFirstChildOfClass("Terrain")
     if terrain then
-        killTerrain(terrain)
+        if terrain.WaterWaveSize ~= 0 then
+            saveProp(terrain, "WaterWaveSize")
+            terrain.WaterWaveSize = 0
+        end
+        if terrain.WaterWaveSpeed ~= 0 then
+            saveProp(terrain, "WaterWaveSpeed")
+            terrain.WaterWaveSpeed = 0
+        end
     end
 
-    killAllInRoot(ws, true)
+    for _, d in ipairs(ws:GetDescendants()) do
+        local cls = d.ClassName
+        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+            or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
+            or cls == "Explosion" or cls == "Highlight"
+            or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
+            or cls == "Decal" or cls == "Texture"
+            or cls == "SurfaceGui" or cls == "BillboardGui" or cls == "ViewportFrame"
+            or cls == "Sound" or cls == "SoundGroup" then
+            killEffect(d)
+        elseif d:IsA("BasePart") then
+            if d.CastShadow then
+                saveProp(d, "CastShadow")
+                d.CastShadow = false
+            end
+            if d:FindFirstAncestorWhichIsA("Accessory") and d.Transparency ~= 1 then
+                saveProp(d, "Transparency")
+                d.Transparency = 1
+            end
+        elseif cls == "ImageLabel" or cls == "ImageButton" then
+            if not d:IsDescendantOf(PlayerGui) and d.Image ~= "" then
+                saveProp(d, "Image")
+                d.Image = ""
+            end
+        end
+    end
 end
 
 local function restoreNoRender()
     for inst, s in next, S.noRender.saved do
         if inst == Lighting then
-            pcall(function()
-                if s.Ambient then Lighting.Ambient = s.Ambient end
-                if s.OutdoorAmbient then Lighting.OutdoorAmbient = s.OutdoorAmbient end
-                if s.Brightness then Lighting.Brightness = s.Brightness end
-                if s.GlobalShadows ~= nil then Lighting.GlobalShadows = s.GlobalShadows end
-                if s.EnvironmentDiffuseScale then Lighting.EnvironmentDiffuseScale = s.EnvironmentDiffuseScale end
-                if s.EnvironmentSpecularScale then Lighting.EnvironmentSpecularScale = s.EnvironmentSpecularScale end
-                if s.ShadowSoftness then Lighting.ShadowSoftness = s.ShadowSoftness end
-                if s.FogEnd then Lighting.FogEnd = s.FogEnd end
-                if s.FogStart then Lighting.FogStart = s.FogStart end
-                if s.ClockTime then Lighting.ClockTime = s.ClockTime end
-            end)
+            if s.Ambient then Lighting.Ambient = s.Ambient end
+            if s.OutdoorAmbient then Lighting.OutdoorAmbient = s.OutdoorAmbient end
+            if s.Brightness then Lighting.Brightness = s.Brightness end
+            if s.GlobalShadows ~= nil then Lighting.GlobalShadows = s.GlobalShadows end
+            if s.FogEnd then Lighting.FogEnd = s.FogEnd end
+            if s.FogStart then Lighting.FogStart = s.FogStart end
+            if s.ClockTime then Lighting.ClockTime = s.ClockTime end
         else
             for prop, v in next, s do
                 pcall(function() inst[prop] = v end)
             end
         end
     end
-    for inst, conn in next, S.noRender.enabledHooks do
-        pcall(function() conn:Disconnect() end)
-    end
-    table.clear(S.noRender.enabledHooks)
     table.clear(S.noRender.saved)
-    S.noRender.count = 0
 end
 
 local function enableNoRender()
     if S.noRender.enabled then return end
     S.noRender.enabled = true
-    applyNoRender()
+    task.spawn(applyNoRender)
 
-    local sweeping = false
-    local function resweep()
-        if sweeping or not S.noRender.enabled then return end
-        sweeping = true
-        task.spawn(function()
-            while S.noRender.enabled do
-                task.wait(0.5)
-                if not S.noRender.enabled then break end
-                killAllInRoot(ws, true)
-            end
-            sweeping = false
-        end)
-    end
-
-    local descConn = ws.DescendantAdded:Connect(function(d)
+    S.noRender.descConn = ws.DescendantAdded:Connect(function(d)
         if not S.noRender.enabled then return end
         if d:IsDescendantOf(PlayerGui) then return end
-        task.defer(function()
-            if not S.noRender.enabled or not d.Parent then return end
-            if d:IsA("BasePart") then
-                killShadow(d)
-                if d:FindFirstAncestorWhichIsA("Accessory") then
-                    killTransparency(d)
+        local cls = d.ClassName
+        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+            or cls == "Smoke" or cls == "Fire" or cls == "Sparkles"
+            or cls == "Explosion" or cls == "Highlight"
+            or cls == "PointLight" or cls == "SpotLight" or cls == "SurfaceLight"
+            or cls == "Decal" or cls == "Texture"
+            or cls == "SurfaceGui" or cls == "BillboardGui" or cls == "ViewportFrame"
+            or cls == "Sound" or cls == "SoundGroup" then
+            task.defer(function()
+                if S.noRender.enabled and d.Parent then
+                    killEffect(d)
                 end
-            end
-            killEffect(d)
-            if d:IsA("ImageLabel") or d:IsA("ImageButton") then
-                killImage(d)
-            end
-        end)
+            end)
+        end
     end)
 
-    local lightingConn = Lighting.ChildAdded:Connect(function(c)
+    S.noRender.lightingConn = Lighting.ChildAdded:Connect(function(c)
         if not S.noRender.enabled then return end
         task.defer(function()
-            if not S.noRender.enabled or not c.Parent then return end
-            killEnv(c)
+            if S.noRender.enabled and c.Parent then
+                killEnv(c)
+            end
         end)
     end)
-
-    S.noRender.sweepConn = {
-        descConn = descConn,
-        lightingConn = lightingConn,
-    }
-
-    resweep()
 end
 
 local function disableNoRender()
     if not S.noRender.enabled then return end
     S.noRender.enabled = false
-    if S.noRender.sweepConn then
-        if S.noRender.sweepConn.descConn then S.noRender.sweepConn.descConn:Disconnect() end
-        if S.noRender.sweepConn.lightingConn then S.noRender.sweepConn.lightingConn:Disconnect() end
-        S.noRender.sweepConn = nil
+    if S.noRender.descConn then
+        S.noRender.descConn:Disconnect()
+        S.noRender.descConn = nil
+    end
+    if S.noRender.lightingConn then
+        S.noRender.lightingConn:Disconnect()
+        S.noRender.lightingConn = nil
     end
     restoreNoRender()
 end
@@ -1031,7 +988,6 @@ local Theme = {
     sidebar     = Color3.fromRGB(12, 12, 15),
     card        = Color3.fromRGB(28, 28, 34),
     cardHover   = Color3.fromRGB(36, 36, 44),
-    cardActive  = Color3.fromRGB(42, 42, 52),
     stroke      = Color3.fromRGB(44, 44, 54),
     strokeLight = Color3.fromRGB(60, 60, 72),
     text        = Color3.fromRGB(248, 248, 252),
@@ -1247,7 +1203,7 @@ local versionTag = Instance.new("TextLabel")
 versionTag.Size = UDim2.new(1, -24, 0, 16)
 versionTag.Position = UDim2.new(0, 12, 1, -28)
 versionTag.BackgroundTransparency = 1
-versionTag.Text = "v2.0.0"
+versionTag.Text = "v2.1.1"
 versionTag.TextColor3 = Theme.textMuted
 versionTag.Font = Enum.Font.Gotham
 versionTag.TextSize = 9
@@ -1671,8 +1627,7 @@ local function makeTab(name, subtitle, order)
             tab.page.Visible = false
             tab.accent.BackgroundTransparency = 1
             tab.label.TextColor3 = Theme.textDim
-            tab.button.BackgroundTransparency = 1
-        end
+            tab.button.BackgroundTransparency = 1        end
         pages[name].page.Visible = true
         pages[name].accent.BackgroundTransparency = 0
         pages[name].label.TextColor3 = Theme.text
@@ -1695,7 +1650,7 @@ local function makeTab(name, subtitle, order)
 end
 
 local combatTab = makeTab("Combat", "Toggles and automation", 1)
-local movementTab = makeTab("Movement", "Ball orbit", 2)
+local movementTab = makeTab("Movement", "Orbit & rage", 2)
 local perfTab = makeTab("Performance", "Lag reduction & burst", 3)
 local tuningTab = makeTab("Tuning", "Precision control", 4)
 local statsTab = makeTab("Stats", "Live telemetry", 5)
@@ -1729,6 +1684,17 @@ S.orbitToggle = makeToggle(movementTab.inner, "Ball Orbit", function(s)
     S.orbit.angle = 0
     S.orbit.lastTick = os.clock()
 end, { table = S.keybinds, name = "orbit" })
+S.rageOrbitToggle = makeToggle(movementTab.inner, "Rage Orbit", function(s)
+    S.rageOrbit.enabled = s
+    if s then
+        task.spawn(function()
+            while S.rageOrbit.enabled and S.alive do
+                rageOrbitTick()
+                task.wait(S.rageOrbit.cooldown)
+            end
+        end)
+    end
+end)
 
 makeToggle(perfTab.inner, "Unlimited KBPS", function(s) setUnlimitedKbps(s) end)
 makeToggle(perfTab.inner, "No Render", function(s)
@@ -2230,6 +2196,7 @@ MiniButton.MouseButton2Click:Connect(function()
     S.spamState.enabled = false
     S.triggerEnabled = false
     S.orbit.enabled = false
+    S.rageOrbit.enabled = false
     S.infiniteMode = false
     if S.renderTickConn then S.renderTickConn:Disconnect() end
     if S.refreshLoopConn then S.refreshLoopConn:Disconnect() end
