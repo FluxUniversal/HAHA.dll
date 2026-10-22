@@ -6,8 +6,6 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Stats = game:GetService("Stats")
 local Debris = game:GetService("Debris")
 local Lighting = game:GetService("Lighting")
-local HttpService = game:GetService("HttpService")
-local GuiService = game:GetService("GuiService")
 
 local LocalPlayer = Players.LocalPlayer
 local localName = LocalPlayer.Name
@@ -102,73 +100,10 @@ local S = {
         cancelDelay = 0.12,
         cancelFraction = 0.35,
     },
-    fflags = {
-        textBox = nil,
-        statusLabel = nil,
-        applied = {},
-        placeholder = '{\n  "DFIntTaskSchedulerTargetFps": "240",\n  "FFlagCommitToGraphicsQualityFix": "True"\n}',
-    },
-    deviceSpoofer = {
-        enabled = false,
-        mode = "PC",
-        originalMt = nil,
-        origIndex = nil,
-        hookedMt = nil,
-        guiOrigInset = nil,
-        enforceConn = nil,
-    },
 }
 
 local UNLIMITED_BURST = 40
 local STANDARD_BURST_CAP = 30
-
-local DEVICE_PROFILES = {
-    PC = {
-        TouchEnabled = false,
-        KeyboardEnabled = true,
-        MouseEnabled = true,
-        GamepadEnabled = false,
-        VREnabled = false,
-        TouchscreenInset = Vector2.new(0, 0),
-        GetLastInputType = Enum.UserInputType.Keyboard,
-        PreferredInput = Enum.PreferredInput.KeyboardAndMouse,
-        AccelerometerEnabled = false,
-        GyroEnabled = false,
-        GamepadSupported = false,
-        KeyboardPosition = Vector2.new(0, 0),
-        MouseIconEnabled = true,
-    },
-    Mobile = {
-        TouchEnabled = true,
-        KeyboardEnabled = false,
-        MouseEnabled = false,
-        GamepadEnabled = false,
-        VREnabled = false,
-        TouchscreenInset = Vector2.new(0, 36),
-        GetLastInputType = Enum.UserInputType.Touch,
-        PreferredInput = Enum.PreferredInput.Touch,
-        AccelerometerEnabled = true,
-        GyroEnabled = true,
-        GamepadSupported = false,
-        KeyboardPosition = Vector2.new(0, 0),
-        MouseIconEnabled = false,
-    },
-    Console = {
-        TouchEnabled = false,
-        KeyboardEnabled = false,
-        MouseEnabled = false,
-        GamepadEnabled = true,
-        VREnabled = false,
-        TouchscreenInset = Vector2.new(0, 0),
-        GetLastInputType = Enum.UserInputType.Gamepad1,
-        PreferredInput = Enum.PreferredInput.Gamepad,
-        AccelerometerEnabled = false,
-        GyroEnabled = false,
-        GamepadSupported = true,
-        KeyboardPosition = Vector2.new(0, 0),
-        MouseIconEnabled = false,
-    },
-}
 
 local function keyName(k)
     if not k then return "None" end
@@ -1088,6 +1023,7 @@ end
 
 local function fireCountFire(spamMode)
     local currentCamera = Camera
+
     local camCFrame = currentCamera.CFrame
     local screenPos
     local mouseLoc = UserInputService:GetMouseLocation()
@@ -1172,6 +1108,8 @@ local function checkParry()
     local position = hrp.Position
     local pingRange = math.clamp(dataPing:GetValue() / 10 / 10, 5, 17)
 
+    local balls = ws:FindFirstChild("Balls")
+    if not balls then return end
     local allBalls = getRealBalls()
     if #allBalls == 0 then return end
 
@@ -1219,6 +1157,8 @@ local function retryParry(resultChar, hitChar)
     if hitChar and hitChar.Parent and hitChar.Parent ~= LocalPlayer.Character and hitChar.Parent.Parent ~= ws.Alive then
         return
     end
+    local balls = ws:FindFirstChild("Balls")
+    if not balls then return end
     local allBalls = getRealBalls()
     if #allBalls == 0 then return end
 
@@ -1346,122 +1286,6 @@ RunService.PostSimulation:Connect(function()
     if not AutoParry then return end
     checkParry()
 end)
-
-local function applyFFlags(jsonText)
-    local ok, decoded = pcall(HttpService.JSONDecode, HttpService, jsonText)
-    if not ok or type(decoded) ~= "table" then
-        return false, "Invalid JSON"
-    end
-    if type(setfflag) ~= "function" then
-        return false, "setfflag not available in this executor"
-    end
-    local applied = 0
-    local failed = {}
-    for name, value in next, decoded do
-        if type(name) ~= "string" or name == "" then
-            table.insert(failed, "invalid name")
-            continue
-        end
-        if type(value) ~= "string" and type(value) ~= "number" and type(value) ~= "boolean" then
-            table.insert(failed, name)
-            continue
-        end
-        local strValue = tostring(value)
-        local okSet = pcall(setfflag, name, strValue)
-        if okSet then
-            S.fflags.applied[name] = strValue
-            applied = applied + 1
-        else
-            table.insert(failed, name)
-        end
-    end
-    if #failed > 0 then
-        return true, string.format("Applied %d/%d, failed: %s", applied, applied + #failed, table.concat(failed, ", ")), applied
-    end
-    return true, string.format("Applied %d flag%s", applied, applied == 1 and "" or "s"), applied
-end
-
-local function installDeviceHooks(mode)
-    local profile = DEVICE_PROFILES[mode]
-    if not profile then return end
-
-    local DS = S.deviceSpoofer
-
-    if DS.hookedMt then
-        pcall(function()
-            setreadonly(DS.hookedMt, false)
-            DS.hookedMt.__index = DS.origIndex
-            setreadonly(DS.hookedMt, true)
-        end)
-        DS.hookedMt = nil
-    end
-
-    local okMt, mt = pcall(getrawmetatable, UserInputService)
-    if not okMt or not mt then
-        pcall(function()
-            if profile.TouchscreenInset then
-                DS.guiOrigInset = DS.guiOrigInset or GuiService.TouchscreenInset
-                GuiService.TouchscreenInset = profile.TouchscreenInset
-            end
-        end)
-        return
-    end
-
-    DS.hookedMt = mt
-    DS.origIndex = mt.__index
-
-    setreadonly(mt, false)
-    mt.__index = function(self, key)
-        local fake = profile[key]
-        if fake ~= nil then
-            return fake
-        end
-        local orig = DS.origIndex
-        if type(orig) == "function" then
-            return orig(self, key)
-        end
-        return rawget(self, key)
-    end
-    setreadonly(mt, true)
-
-    pcall(function()
-        if profile.TouchscreenInset then
-            DS.guiOrigInset = DS.guiOrigInset or GuiService.TouchscreenInset
-            GuiService.TouchscreenInset = profile.TouchscreenInset
-        end
-    end)
-end
-
-local function uninstallDeviceHooks()
-    local DS = S.deviceSpoofer
-    if DS.hookedMt then
-        pcall(function()
-            setreadonly(DS.hookedMt, false)
-            DS.hookedMt.__index = DS.origIndex
-            setreadonly(DS.hookedMt, true)
-        end)
-        DS.hookedMt = nil
-    end
-    if DS.guiOrigInset then
-        pcall(function()
-            GuiService.TouchscreenInset = DS.guiOrigInset
-        end)
-        DS.guiOrigInset = nil
-    end
-end
-
-local function setDeviceSpoofer(enabled, mode)
-    local DS = S.deviceSpoofer
-    if enabled then
-        if not mode then mode = DS.mode or "PC" end
-        DS.mode = mode
-        DS.enabled = true
-        installDeviceHooks(mode)
-    else
-        DS.enabled = false
-        uninstallDeviceHooks()
-    end
-end
 
 local Theme = {
     bg          = Color3.fromRGB(16, 16, 19),
@@ -1685,7 +1509,7 @@ local versionTag = Instance.new("TextLabel")
 versionTag.Size = UDim2.new(1, -24, 0, 16)
 versionTag.Position = UDim2.new(0, 12, 1, -28)
 versionTag.BackgroundTransparency = 1
-versionTag.Text = "v3.5.0"
+versionTag.Text = "v3.3.0"
 versionTag.TextColor3 = Theme.textMuted
 versionTag.Font = Enum.Font.Gotham
 versionTag.TextSize = 9
@@ -2134,10 +1958,10 @@ end
 
 local combatTab = makeTab("Combat", "Toggles and automation", 1)
 local movementTab = makeTab("Movement", "Orbit & rage", 2)
-local perfTab = makeTab("Performance", "Lag reduction & fflags", 3)
+local perfTab = makeTab("Performance", "Lag reduction & burst", 3)
 local tuningTab = makeTab("Tuning", "Precision control", 4)
 local statsTab = makeTab("Stats", "Live telemetry", 5)
-local playerTab = makeTab("Player", "Buttons & device spoofer", 6)
+local playerTab = makeTab("Player", "On-screen buttons", 6)
 
 local AutoParry = false
 
@@ -2190,161 +2014,6 @@ S.infiniteToggle = makeToggle(perfTab.inner, "Unlimited spam", function(s)
             S.refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
         end
     end
-end)
-
-local fflagSection = Instance.new("Frame")
-fflagSection.Size = UDim2.new(1, -8, 0, 240)
-fflagSection.BackgroundColor3 = Theme.card
-fflagSection.BorderSizePixel = 0
-fflagSection.ZIndex = 5
-fflagSection.Parent = perfTab.inner
-Instance.new("UICorner", fflagSection).CornerRadius = UDim.new(0, 10)
-
-local fflagStroke = Instance.new("UIStroke")
-fflagStroke.Color = Theme.stroke
-fflagStroke.Thickness = 1
-fflagStroke.Transparency = 0.4
-fflagStroke.Parent = fflagSection
-
-local fflagTitle = Instance.new("TextLabel")
-fflagTitle.Size = UDim2.new(1, -32, 0, 16)
-fflagTitle.Position = UDim2.new(0, 16, 0, 8)
-fflagTitle.BackgroundTransparency = 1
-fflagTitle.Text = "Fast Flags Editor"
-fflagTitle.TextColor3 = Theme.text
-fflagTitle.Font = Enum.Font.GothamMedium
-fflagTitle.TextSize = 13
-fflagTitle.TextXAlignment = Enum.TextXAlignment.Left
-fflagTitle.ZIndex = 6
-fflagTitle.Parent = fflagSection
-
-local fflagHint = Instance.new("TextLabel")
-fflagHint.Size = UDim2.new(1, -32, 0, 12)
-fflagHint.Position = UDim2.new(0, 16, 0, 24)
-fflagHint.BackgroundTransparency = 1
-fflagHint.Text = "paste a JSON object of fflags"
-fflagHint.TextColor3 = Theme.textMuted
-fflagHint.Font = Enum.Font.Gotham
-fflagHint.TextSize = 9
-fflagHint.TextXAlignment = Enum.TextXAlignment.Left
-fflagHint.ZIndex = 6
-fflagHint.Parent = fflagSection
-
-local fflagBox = Instance.new("TextBox")
-fflagBox.Size = UDim2.new(1, -32, 0, 130)
-fflagBox.Position = UDim2.new(0, 16, 0, 42)
-fflagBox.BackgroundColor3 = Theme.keybg
-fflagBox.BorderSizePixel = 0
-fflagBox.Text = S.fflags.placeholder
-fflagBox.TextColor3 = Theme.text
-fflagBox.PlaceholderText = "{\n  \"DFIntTaskSchedulerTargetFps\": \"240\"\n}"
-fflagBox.PlaceholderColor3 = Theme.textMuted
-fflagBox.Font = Enum.Font.Code
-fflagBox.TextSize = 11
-fflagBox.TextWrapped = true
-fflagBox.TextXAlignment = Enum.TextXAlignment.Left
-fflagBox.TextYAlignment = Enum.TextYAlignment.Top
-fflagBox.MultiLine = true
-fflagBox.ClearTextOnFocus = false
-fflagBox.ZIndex = 6
-fflagBox.Parent = fflagSection
-Instance.new("UICorner", fflagBox).CornerRadius = UDim.new(0, 6)
-local fflagBoxPad = Instance.new("UIPadding")
-fflagBoxPad.PaddingLeft = UDim.new(0, 8)
-fflagBoxPad.PaddingRight = UDim.new(0, 8)
-fflagBoxPad.PaddingTop = UDim.new(0, 6)
-fflagBoxPad.PaddingBottom = UDim.new(0, 6)
-fflagBoxPad.Parent = fflagBox
-local fflagBoxStroke = Instance.new("UIStroke")
-fflagBoxStroke.Color = Theme.stroke
-fflagBoxStroke.Thickness = 1
-fflagBoxStroke.Parent = fflagBox
-fflagBox.Focused:Connect(function()
-    TweenService:Create(fflagBoxStroke, TweenInfo.new(0.15), { Color = Theme.accent }):Play()
-end)
-fflagBox.FocusLost:Connect(function()
-    TweenService:Create(fflagBoxStroke, TweenInfo.new(0.1), { Color = Theme.stroke }):Play()
-end)
-
-S.fflags.textBox = fflagBox
-
-local fflagStatus = Instance.new("TextLabel")
-fflagStatus.Size = UDim2.new(1, -140, 0, 20)
-fflagStatus.Position = UDim2.new(0, 16, 0, 178)
-fflagStatus.BackgroundTransparency = 1
-fflagStatus.Text = "ready"
-fflagStatus.TextColor3 = Theme.textMuted
-fflagStatus.Font = Enum.Font.Gotham
-fflagStatus.TextSize = 10
-fflagStatus.TextXAlignment = Enum.TextXAlignment.Left
-fflagStatus.ZIndex = 6
-fflagStatus.Parent = fflagSection
-
-S.fflags.statusLabel = fflagStatus
-
-local setFlagsBtn = Instance.new("TextButton")
-setFlagsBtn.Size = UDim2.new(0, 110, 0, 32)
-setFlagsBtn.Position = UDim2.new(1, -126, 0, 176)
-setFlagsBtn.BackgroundColor3 = Theme.accent
-setFlagsBtn.BorderSizePixel = 0
-setFlagsBtn.Text = "Set FFlags"
-setFlagsBtn.TextColor3 = Color3.fromRGB(16, 24, 18)
-setFlagsBtn.Font = Enum.Font.GothamBold
-setFlagsBtn.TextSize = 12
-setFlagsBtn.AutoButtonColor = false
-setFlagsBtn.ZIndex = 6
-setFlagsBtn.Parent = fflagSection
-Instance.new("UICorner", setFlagsBtn).CornerRadius = UDim.new(0, 7)
-
-setFlagsBtn.MouseEnter:Connect(function()
-    TweenService:Create(setFlagsBtn, TweenInfo.new(0.12), {
-        BackgroundColor3 = Theme.accentDim
-    }):Play()
-end)
-setFlagsBtn.MouseLeave:Connect(function()
-    TweenService:Create(setFlagsBtn, TweenInfo.new(0.12), {
-        BackgroundColor3 = Theme.accent
-    }):Play()
-end)
-
-setFlagsBtn.MouseButton1Click:Connect(function()
-    local text = fflagBox.Text
-    local ok, msg, count = applyFFlags(text)
-    if ok then
-        fflagStatus.Text = msg
-        fflagStatus.TextColor3 = Theme.accent
-        TweenService:Create(setFlagsBtn, TweenInfo.new(0.15), {
-            BackgroundColor3 = Color3.fromRGB(180, 240, 200)
-        }):Play()
-        task.delay(0.2, function()
-            TweenService:Create(setFlagsBtn, TweenInfo.new(0.2), {
-                BackgroundColor3 = Theme.accent
-            }):Play()
-        end)
-    else
-        fflagStatus.Text = "Error: " .. tostring(msg)
-        fflagStatus.TextColor3 = Theme.danger
-    end
-end)
-
-local clearFlagsBtn = Instance.new("TextButton")
-clearFlagsBtn.Size = UDim2.new(0, 80, 0, 20)
-clearFlagsBtn.Position = UDim2.new(1, -96, 0, 8)
-clearFlagsBtn.BackgroundColor3 = Theme.cardHover
-clearFlagsBtn.BorderSizePixel = 0
-clearFlagsBtn.Text = "clear"
-clearFlagsBtn.TextColor3 = Theme.textDim
-clearFlagsBtn.Font = Enum.Font.GothamBold
-clearFlagsBtn.TextSize = 10
-clearFlagsBtn.AutoButtonColor = false
-clearFlagsBtn.ZIndex = 6
-clearFlagsBtn.Parent = fflagSection
-Instance.new("UICorner", clearFlagsBtn).CornerRadius = UDim.new(0, 5)
-
-clearFlagsBtn.MouseButton1Click:Connect(function()
-    fflagBox.Text = "{\n  \n}"
-    fflagStatus.Text = "cleared"
-    fflagStatus.TextColor3 = Theme.textMuted
 end)
 
 makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 500, S.spamState.rate, function(v)
@@ -2584,133 +2253,6 @@ makeToggle(playerTab.inner, "Triggerbot Button", function(s)
     if not s then S.triggerButton.setState(false, true) end
 end)
 
-local deviceSection = Instance.new("Frame")
-deviceSection.Size = UDim2.new(1, -8, 0, 118)
-deviceSection.BackgroundColor3 = Theme.card
-deviceSection.BorderSizePixel = 0
-deviceSection.ZIndex = 5
-deviceSection.Parent = playerTab.inner
-Instance.new("UICorner", deviceSection).CornerRadius = UDim.new(0, 10)
-
-local devStroke = Instance.new("UIStroke")
-devStroke.Color = Theme.stroke
-devStroke.Thickness = 1
-devStroke.Transparency = 0.4
-devStroke.Parent = deviceSection
-
-local devTitle = Instance.new("TextLabel")
-devTitle.Size = UDim2.new(1, -32, 0, 16)
-devTitle.Position = UDim2.new(0, 16, 0, 8)
-devTitle.BackgroundTransparency = 1
-devTitle.Text = "Device Spoofer"
-devTitle.TextColor3 = Theme.text
-devTitle.Font = Enum.Font.GothamMedium
-devTitle.TextSize = 13
-devTitle.TextXAlignment = Enum.TextXAlignment.Left
-devTitle.ZIndex = 6
-devTitle.Parent = deviceSection
-
-local devHint = Instance.new("TextLabel")
-devHint.Size = UDim2.new(1, -32, 0, 12)
-devHint.Position = UDim2.new(0, 16, 0, 24)
-devHint.BackgroundTransparency = 1
-devHint.Text = "spoof what scripts read, not your real input"
-devHint.TextColor3 = Theme.textMuted
-devHint.Font = Enum.Font.Gotham
-devHint.TextSize = 9
-devHint.TextXAlignment = Enum.TextXAlignment.Left
-devHint.ZIndex = 6
-devHint.Parent = deviceSection
-
-local devModeLabel = Instance.new("TextLabel")
-devModeLabel.Size = UDim2.new(0, 100, 0, 16)
-devModeLabel.Position = UDim2.new(0, 16, 0, 50)
-devModeLabel.BackgroundTransparency = 1
-devModeLabel.Text = "Mode"
-devModeLabel.TextColor3 = Theme.textDim
-devModeLabel.Font = Enum.Font.Gotham
-devModeLabel.TextSize = 11
-devModeLabel.TextXAlignment = Enum.TextXAlignment.Left
-devModeLabel.ZIndex = 6
-devModeLabel.Parent = deviceSection
-
-local modes = { "PC", "Mobile", "Console" }
-local modeButtons = {}
-local selectedMode = S.deviceSpoofer.mode
-
-local function refreshModeButtons()
-    for _, b in ipairs(modeButtons) do
-        if b.mode == selectedMode then
-            TweenService:Create(b.btn, TweenInfo.new(0.15), {
-                BackgroundColor3 = Theme.accent,
-            }):Play()
-            b.lbl.TextColor3 = Color3.fromRGB(16, 24, 18)
-        else
-            TweenService:Create(b.btn, TweenInfo.new(0.15), {
-                BackgroundColor3 = Theme.chip,
-            }):Play()
-            b.lbl.TextColor3 = Theme.textDim
-        end
-    end
-end
-
-local function makeDeviceModeButton(mode, order)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 96, 0, 28)
-    btn.Position = UDim2.new(0, 16 + (order - 1) * 102, 0, 70)
-    btn.BackgroundColor3 = Theme.chip
-    btn.BorderSizePixel = 0
-    btn.Text = ""
-    btn.AutoButtonColor = false
-    btn.ZIndex = 6
-    btn.Parent = deviceSection
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, 0, 1, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = mode
-    lbl.TextColor3 = Theme.textDim
-    lbl.Font = Enum.Font.GothamBold
-    lbl.TextSize = 12
-    lbl.ZIndex = 7
-    lbl.Parent = btn
-
-    btn.MouseEnter:Connect(function()
-        if selectedMode ~= mode then
-            TweenService:Create(btn, TweenInfo.new(0.12), {
-                BackgroundColor3 = Theme.cardHover,
-            }):Play()
-        end
-    end)
-    btn.MouseLeave:Connect(function()
-        if selectedMode ~= mode then
-            TweenService:Create(btn, TweenInfo.new(0.12), {
-                BackgroundColor3 = Theme.chip,
-            }):Play()
-        end
-    end)
-    btn.MouseButton1Click:Connect(function()
-        selectedMode = mode
-        S.deviceSpoofer.mode = mode
-        refreshModeButtons()
-        if S.deviceSpoofer.enabled then
-            setDeviceSpoofer(true, mode)
-        end
-    end)
-
-    table.insert(modeButtons, { btn = btn, lbl = lbl, mode = mode })
-end
-
-for i, m in ipairs(modes) do
-    makeDeviceModeButton(m, i)
-end
-refreshModeButtons()
-
-makeToggle(playerTab.inner, "Device Spoofer", function(s)
-    setDeviceSpoofer(s, selectedMode)
-end)
-
 closeBtn.MouseEnter:Connect(function()
     tween(closeBtn, { BackgroundColor3 = Theme.danger, TextColor3 = Color3.new(1,1,1) }, 0.12)
     tween(closeStroke, { Color = Theme.danger, Transparency = 0 }, 0.12)
@@ -2915,10 +2457,6 @@ MiniButton.MouseButton2Click:Connect(function()
     S.unlimitedMode = false
     if S.refreshLoopConn then S.refreshLoopConn:Disconnect() end
     if S.noRender.enabled then disableNoRender() end
-    if S.deviceSpoofer.enabled then
-        S.deviceSpoofer.enabled = false
-        uninstallDeviceHooks()
-    end
     ScreenGui:Destroy()
 end)
 
