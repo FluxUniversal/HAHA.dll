@@ -19,12 +19,43 @@ ws:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
     Camera = ws.CurrentCamera
 end)
 
+local PI = {
+    interval = 0.01,
+    integral = 0,
+    integral_cap = 0.02,
+    deadband = 0.00015,
+    kp = 0.35,
+    ki = 0.012,
+    ema_alpha = 0.12,
+    ema_one_minus = 0.88,
+    decay = 1 - (1 / 512),
+    drift_accum = 0,
+    residual = 0,
+    tick_n = 0,
+    suppressed = 0,
+    session_start = 0,
+    ema_error = 0,
+    phase_offset = 0,
+    nano_cd = 16,
+    micro_cd = 64,
+    nano_clamp = 0.002,
+    micro_clamp = 0.004,
+    nano_gain = 0.05,
+    micro_gain = 0.15,
+    half_interval = 0.005,
+    max_lag = 0.01,
+    max_fires_per_frame = 64,
+    ring_size = 1024,
+    ring = table.create(1024, 0),
+    ring_head = 0,
+}
+
 local S = {
     CONFIG = { FireArg = 0.5, Accuracy = 85, AccuracyMode = "auto" },
     keybinds = { spam = Enum.KeyCode.X, trigger = Enum.KeyCode.C, orbit = Enum.KeyCode.O },
     orbit = { enabled = false, angle = 0, radius = 12, speed = 6, lastTick = os.clock() },
     rageOrbit = { enabled = false, cooldown = 0, studs = 23 },
-    spamState = { enabled = false, rate = 100, accumulator = 0, lastFrame = os.clock(), maxDt = 0.05, maxGuard = 20 },
+    spamState = { enabled = false, rate = 240 },
     remotesHook = { mt = {}, orig = {}, captured = {}, tokenFn = nil, firstSignal = nil, done = false, descConn = nil },
     noRender = {
         enabled = false,
@@ -34,13 +65,6 @@ local S = {
     },
     armingBox = nil,
     armingKey = nil,
-    unlimitedKbps = false,
-    raknet = nil,
-    raknetAvailable = false,
-    raknetQueue = {},
-    raknetQueueLimit = 512,
-    lastRaknetFlush = 0,
-    infiniteMode = false,
     alive = true,
     hotRemote = nil,
     hotArgs1 = nil,
@@ -73,8 +97,6 @@ local S = {
     aliveFolderCacheAt = 0,
     refreshLoopConn = nil,
     triggerEnabled = false,
-    infiniteBurst = 40,
-    infiniteBurstKB = 50,
     orbBallsCache = nil,
     orbBallsCacheAt = 0,
     ballPositions = {},
@@ -88,26 +110,13 @@ local S = {
     statusVelocity = nil,
     statusPing = nil,
     statusAcc = nil,
-    statusNet = nil,
+    statusRPS = nil,
     accuracySlider = nil,
     spamToggle = nil,
     triggerToggle = nil,
     orbitToggle = nil,
     rageOrbitToggle = nil,
-    infiniteToggle = nil,
-    unlimitedToggle = nil,
-    unlimitedWarn = nil,
 }
-
-do
-    S.raknet = rawget(getfenv(), "raknet") or rawget(getfenv(), "rnet") or (getgenv and getgenv().raknet) or (getgenv and getgenv().rnet)
-    if S.raknet then
-        local ok = pcall(function() return S.raknet.sendraw end)
-        if ok and type(S.raknet.sendraw) == "function" then
-            S.raknetAvailable = true
-        end
-    end
-end
 
 local function keyName(k)
     if not k then return "None" end
@@ -869,85 +878,33 @@ local function disableNoRender()
     restoreNoRender()
 end
 
-local function refreshGuard()
-    local base = S.unlimitedKbps and 0.15 or 0.05
-    S.spamState.maxDt = base
-    S.spamState.maxGuard = math.max(20, math.floor(S.spamState.rate * base * 2))
+local function resetPI()
+    PI.integral = 0
+    PI.residual = 0
+    PI.ema_error = 0
+    PI.drift_accum = 0
+    PI.tick_n = 0
+    PI.suppressed = 0
+    PI.phase_offset = 0
+    PI.nano_cd = 16
+    PI.micro_cd = 64
+    PI.session_start = os.clock()
+    PI.ema_one_minus = 1 - PI.ema_alpha
+    PI.ring_head = 0
+    for i = 1, PI.ring_size do PI.ring[i] = 0 end
 end
 
-local function queueRaknetFire(remote)
-    if not S.raknetAvailable or not S.unlimitedKbps then return false end
-    local q = S.raknetQueue
-    if #q >= S.raknetQueueLimit then return false end
-    q[#q + 1] = remote
-    return true
-end
-
-local function flushRaknetQueue()
-    if not S.raknetAvailable or not S.unlimitedKbps then return end
-    local q = S.raknetQueue
-    if #q == 0 then return end
-    local now = os.clock()
-    if now - S.lastRaknetFlush < 0.004 then return end
-    S.lastRaknetFlush = now
-
-    refreshCachedToken()
-    refreshPayload()
-
-    local rn = S.raknet
-    local tok = S.cachedToken
-    local sc = S.cachedScale
-    local cf = S.cachedCframe
-    local scr = S.cachedScreen
-    local aim = S.cachedAim
-    local a1 = S.hotArgs1
-    local a2 = S.hotArgs2
-
-    local maxPerFlush = 32
-    local sent = 0
-    local i = 1
-    while i <= #q and sent < maxPerFlush do
-        local remote = q[i]
-        i = i + 1
-        sent = sent + 1
-        local bytes
-        if rn.fire then
-            local ok, data = pcall(rn.fire, remote, a1, a2, tok, sc, cf, scr, aim, false)
-            if ok then bytes = data end
-        elseif rn.encodeRemote then
-            local ok, data = pcall(rn.encodeRemote, remote, {a1, a2, tok, sc, cf, scr, aim, false})
-            if ok then bytes = data end
-        end
-        if not bytes then
-            S.unlimitedKbps = false
-            if S.unlimitedToggle then S.unlimitedToggle.set(false) end
-            if S.unlimitedWarn then
-                S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
-                S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (encode failed)"
-            end
-            break
-        end
-        local okSend = pcall(rn.sendraw, bytes)
-        if not okSend then
-            S.unlimitedKbps = false
-            if S.unlimitedToggle then S.unlimitedToggle.set(false) end
-            if S.unlimitedWarn then
-                S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
-                S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (sendraw failed)"
-            end
-            break
-        end
-    end
-
-    if i > 1 then
-        local newQ = {}
-        local n = 0
-        for j = i, #q do
-            n = n + 1
-            newQ[n] = q[j]
-        end
-        S.raknetQueue = newQ
-    end
+local function applyRPS(rps)
+    rps = math.clamp(rps, 1, 640)
+    S.spamState.rate = rps
+    PI.interval = 1 / rps
+    PI.integral_cap = 2 * PI.interval
+    PI.deadband = PI.interval * 0.015
+    PI.nano_clamp = PI.interval * 0.2
+    PI.micro_clamp = PI.interval * 0.4
+    PI.half_interval = PI.interval * 0.5
+    PI.max_lag = PI.interval
+    PI.max_fires_per_frame = math.max(20, math.floor(rps * 0.05 * 2))
 end
 
 local arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
@@ -963,82 +920,83 @@ local function refreshSpamArgs()
     arg8 = false
 end
 
-local function fireBurst(remote, fn, count)
-    local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
-    if S.unlimitedKbps and S.raknetAvailable then
-        local i = 0
-        while i < count do
-            if not queueRaknetFire(remote) then break end
-            i = i + 1
-        end
-        return
-    end
-    local i = 0
-    while i + 8 <= count do
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        i = i + 8
-    end
-    while i + 4 <= count do
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        i = i + 4
-    end
-    while i < count do
-        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
-        i = i + 1
-    end
-end
-
-local function doSpamTick()
-    local spamState = S.spamState
-    if not spamState.enabled then return end
+local function spamTick()
+    if not S.spamState.enabled then return end
     if not S.hotRemote or not S.fireMethod then
         if next(S.remotesHook.captured) ~= nil then refreshHot() end
         if not S.hotRemote or not S.fireMethod then return end
     end
 
-    local remote = S.hotRemote
-    local method = S.fireMethod
-
-    if S.infiniteMode then
-        refreshPayload()
-        refreshCachedToken()
-        refreshSpamArgs()
-        local burst = S.unlimitedKbps and S.infiniteBurstKB or S.infiniteBurst
-        fireBurst(remote, method, burst)
-        return
-    end
-
     local now = os.clock()
-    local dt = now - spamState.lastFrame
-    spamState.lastFrame = now
-    local maxDt = spamState.maxDt
-    if dt > maxDt then dt = maxDt end
-
-    local rate = spamState.rate
-    local acc = spamState.accumulator + dt * rate
-    if acc < 1 then
-        spamState.accumulator = acc
-        return
-    end
-    local guard = spamState.maxGuard
-    if acc > guard then acc = guard end
-    local count = math.floor(acc)
-    spamState.accumulator = acc - count
+    local ideal = PI.session_start + (PI.tick_n - PI.suppressed) * PI.interval + PI.phase_offset
+    local firesDue = math.floor((now - ideal) / PI.interval) + 1
+    if firesDue <= 0 then return end
+    if firesDue > PI.max_fires_per_frame then firesDue = PI.max_fires_per_frame end
 
     refreshPayload()
     refreshCachedToken()
     refreshSpamArgs()
-    fireBurst(remote, method, count)
+
+    local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
+    local remote = S.hotRemote
+    local method = S.fireMethod
+
+    for i = 1, firesDue do
+        method(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        PI.tick_n = PI.tick_n + 1
+        PI.ring_head = (PI.ring_head % PI.ring_size) + 1
+        PI.ring[PI.ring_head] = now
+    end
+
+    local abs_elapsed = now - PI.session_start
+    local abs_expected = (PI.tick_n - PI.suppressed) * PI.interval
+
+    PI.nano_cd = PI.nano_cd - firesDue
+    while PI.nano_cd <= 0 do
+        PI.nano_cd = PI.nano_cd + 16
+        local err = abs_elapsed - abs_expected
+        if err > PI.nano_clamp then err = PI.nano_clamp
+        elseif err < -PI.nano_clamp then err = -PI.nano_clamp end
+        PI.phase_offset = PI.phase_offset - err * PI.nano_gain
+    end
+
+    PI.micro_cd = PI.micro_cd - firesDue
+    while PI.micro_cd <= 0 do
+        PI.micro_cd = PI.micro_cd + 64
+        local err = abs_elapsed - abs_expected
+        if err > PI.micro_clamp then err = PI.micro_clamp
+        elseif err < -PI.micro_clamp then err = -PI.micro_clamp end
+        PI.phase_offset = PI.phase_offset - err * PI.micro_gain
+    end
+
+    local raw_error = abs_elapsed - abs_expected
+    PI.ema_error = PI.ema_one_minus * PI.ema_error + PI.ema_alpha * raw_error
+    local error = PI.ema_error
+
+    if error > PI.deadband or error < -PI.deadband then
+        PI.integral = PI.integral + error
+        if PI.integral > PI.integral_cap then PI.integral = PI.integral_cap
+        elseif PI.integral < -PI.integral_cap then PI.integral = -PI.integral_cap end
+        local correction = PI.kp * error + PI.ki * PI.integral
+        PI.drift_accum = PI.drift_accum + correction
+        local carry = math.floor(PI.drift_accum / PI.interval + 0.5) * PI.interval
+        PI.drift_accum = PI.drift_accum - carry
+        PI.residual = PI.residual + (correction - carry)
+        local res_carry = math.floor(PI.residual / PI.interval + 0.5) * PI.interval
+        PI.residual = PI.residual - res_carry
+        PI.phase_offset = PI.phase_offset - correction
+    else
+        PI.integral = PI.integral * PI.decay
+    end
+
+    local next_ideal = PI.session_start + (PI.tick_n - PI.suppressed) * PI.interval + PI.phase_offset
+    local lag = now - next_ideal
+    if lag > PI.max_lag then
+        PI.session_start = now - (PI.tick_n - PI.suppressed) * PI.interval - PI.phase_offset
+        PI.suppressed = PI.suppressed + 1
+    elseif lag > PI.half_interval then
+        PI.session_start = PI.session_start + lag * 0.5
+    end
 end
 
 local function ensureHot()
@@ -1059,43 +1017,8 @@ local function ensureHot()
 end
 
 S.refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
-RunService.PreSimulation:Connect(doSpamTick)
-RunService.Heartbeat:Connect(doSpamTick)
-RunService.RenderStepped:Connect(function()
-    flushRaknetQueue()
-end)
-
-local function setUnlimitedKbps(enabled)
-    if enabled and not S.raknetAvailable then
-        S.unlimitedKbps = false
-        if S.unlimitedToggle then S.unlimitedToggle.set(false) end
-        if S.unlimitedWarn then
-            S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
-            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (not detected)"
-        end
-        return
-    end
-    S.unlimitedKbps = enabled
-    S.screenRefreshThreshold = enabled and 1.0 or 0.016
-    S.payloadRefreshThreshold = enabled and 0.05 or 0.016
-    refreshGuard()
-    S.spamState.accumulator = 0
-    S.spamState.lastFrame = os.clock()
-    if enabled then
-        S.raknetQueue = {}
-        S.lastRaknetFlush = 0
-        if S.unlimitedWarn then
-            S.unlimitedWarn.TextColor3 = Color3.fromRGB(245, 190, 100)
-            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (active)"
-        end
-    else
-        S.raknetQueue = {}
-        if S.unlimitedWarn then
-            S.unlimitedWarn.TextColor3 = Color3.fromRGB(150, 150, 160)
-            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY"
-        end
-    end
-end
+RunService.PreSimulation:Connect(spamTick)
+RunService.Heartbeat:Connect(spamTick)
 
 local Theme = {
     bg          = Color3.fromRGB(16, 16, 19),
@@ -1125,6 +1048,18 @@ end
 
 local activeDrag = nil
 
+local function hideDragBlocker()
+    if DragBlocker then
+        DragBlocker.Visible = false
+    end
+end
+
+local function showDragBlocker()
+    if DragBlocker then
+        DragBlocker.Visible = true
+    end
+end
+
 UserInputService.InputChanged:Connect(function(input)
     local d = activeDrag
     if not d then return end
@@ -1135,12 +1070,14 @@ UserInputService.InputChanged:Connect(function(input)
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    local d = activeDrag
-    if not d then return end
     local t = input.UserInputType
     if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+        local d = activeDrag
         activeDrag = nil
-        if d.onEnd then d.onEnd() end
+        hideDragBlocker()
+        if d and d.onEnd then
+            d.onEnd()
+        end
     end
 end)
 
@@ -1151,6 +1088,18 @@ ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 999
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.Parent = PlayerGui
+
+local DragBlocker = Instance.new("TextButton")
+DragBlocker.Name = "DragBlocker"
+DragBlocker.Size = UDim2.new(1, 0, 1, 0)
+DragBlocker.Position = UDim2.new(0, 0, 0, 0)
+DragBlocker.BackgroundTransparency = 1
+DragBlocker.Text = ""
+DragBlocker.BorderSizePixel = 0
+DragBlocker.AutoButtonColor = false
+DragBlocker.Visible = false
+DragBlocker.ZIndex = 2147483647
+DragBlocker.Parent = ScreenGui
 
 local PANEL_W = 500
 local PANEL_H = 380
@@ -1174,6 +1123,7 @@ MainFrame.BackgroundColor3 = Theme.bg
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
 MainFrame.ZIndex = 2
+MainFrame.Active = true
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 18)
 
@@ -1197,6 +1147,7 @@ Sidebar.Size = UDim2.new(0, SIDEBAR_W, 1, 0)
 Sidebar.BackgroundColor3 = Theme.sidebar
 Sidebar.BorderSizePixel = 0
 Sidebar.ZIndex = 3
+Sidebar.Active = true
 Sidebar.Parent = MainFrame
 
 local sbCorner = Instance.new("UICorner")
@@ -1319,7 +1270,7 @@ local versionTag = Instance.new("TextLabel")
 versionTag.Size = UDim2.new(1, -24, 0, 16)
 versionTag.Position = UDim2.new(0, 12, 1, -28)
 versionTag.BackgroundTransparency = 1
-versionTag.Text = "v2.2.1"
+versionTag.Text = "v3.0.1"
 versionTag.TextColor3 = Theme.textMuted
 versionTag.Font = Enum.Font.Gotham
 versionTag.TextSize = 9
@@ -1664,7 +1615,11 @@ local function makeSlider(parent, label, min, max, initial, onChanged)
         or input.UserInputType == Enum.UserInputType.Touch then
             dragAbsX = track.AbsolutePosition.X
             dragSizeX = track.AbsoluteSize.X
-            activeDrag = { onMove = function(x) trackToValue(x) end }
+            activeDrag = {
+                onMove = function(x) trackToValue(x) end,
+                onEnd = function() hideDragBlocker() end,
+            }
+            showDragBlocker()
             trackToValue(input.Position.X)
         end
     end)
@@ -1768,7 +1723,7 @@ end
 
 local combatTab = makeTab("Combat", "Toggles and automation", 1)
 local movementTab = makeTab("Movement", "Orbit & rage", 2)
-local perfTab = makeTab("Performance", "Lag reduction & burst", 3)
+local perfTab = makeTab("Performance", "Lag reduction", 3)
 local tuningTab = makeTab("Tuning", "Precision control", 4)
 local statsTab = makeTab("Stats", "Live telemetry", 5)
 local playerTab = makeTab("Player", "On-screen buttons", 6)
@@ -1778,13 +1733,9 @@ local AutoParry = false
 makeToggle(combatTab.inner, "Auto parry", function(s) AutoParry = s end)
 S.spamToggle = makeToggle(combatTab.inner, "Manual spam", function(s)
     S.spamState.enabled = s
-    S.spamState.accumulator = 0
-    S.spamState.lastFrame = os.clock()
     if s then
         if next(S.remotesHook.captured) ~= nil then refreshHot() end
-        if not S.refreshLoopConn then
-            S.refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
-        end
+        resetPI()
     end
 end, { table = S.keybinds, name = "spam" })
 S.triggerToggle = makeToggle(combatTab.inner, "Triggerbot", function(s)
@@ -1816,38 +1767,9 @@ end)
 makeToggle(perfTab.inner, "No Render", function(s)
     if s then enableNoRender() else disableNoRender() end
 end)
-S.infiniteToggle = makeToggle(perfTab.inner, "Infinite spam", function(s)
-    S.infiniteMode = s
-    if s then
-        if next(S.remotesHook.captured) ~= nil then refreshHot() end
-        if not S.refreshLoopConn then
-            S.refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
-        end
-    end
-end)
 
-S.unlimitedToggle = makeToggle(perfTab.inner, "Unlimited KBPS", function(s)
-    setUnlimitedKbps(s)
-end)
-S.unlimitedWarn = Instance.new("TextLabel")
-S.unlimitedWarn.Size = UDim2.new(1, -8, 0, 16)
-S.unlimitedWarn.BackgroundTransparency = 1
-S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY"
-S.unlimitedWarn.TextColor3 = S.raknetAvailable and Theme.textMuted or Theme.danger
-S.unlimitedWarn.Font = Enum.Font.GothamBold
-S.unlimitedWarn.TextSize = 10
-S.unlimitedWarn.TextXAlignment = Enum.TextXAlignment.Center
-S.unlimitedWarn.ZIndex = 6
-S.unlimitedWarn.LayoutOrder = S.unlimitedToggle.row.LayoutOrder + 1
-S.unlimitedWarn.Parent = perfTab.inner
-if not S.raknetAvailable then
-    S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (not detected)"
-    S.unlimitedWarn.TextColor3 = Theme.danger
-end
-
-makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 1000, S.spamState.rate, function(v)
-    S.spamState.rate = v
-    refreshGuard()
+makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 640, S.spamState.rate, function(v)
+    applyRPS(v)
 end)
 S.accuracySlider = makeSlider(tuningTab.inner, "Accuracy", 40, 100, S.CONFIG.Accuracy, function(v) S.CONFIG.Accuracy = v end)
 makeToggle(tuningTab.inner, "Auto accuracy", function(s)
@@ -1908,7 +1830,7 @@ end
 S.statusVelocity = makeStatRow(12, "Ball velocity")
 S.statusPing = makeStatRow(44, "Ping")
 S.statusAcc = makeStatRow(76, "Effective accuracy")
-S.statusNet = makeStatRow(108, "Network path")
+S.statusRPS = makeStatRow(108, "Actual RPS")
 
 currentTab = "Combat"
 pages["Combat"].page.Visible = true
@@ -2028,6 +1950,7 @@ local function createDraggableButton(name, label, accentColor, callback)
             startPos = btn.Position
             isDragging = true
             moved = false
+            showDragBlocker()
             local changedConn, endConn
             changedConn = UserInputService.InputChanged:Connect(function(m)
                 if not isDragging then return end
@@ -2051,6 +1974,7 @@ local function createDraggableButton(name, label, accentColor, callback)
                     isDragging = false
                     changedConn:Disconnect()
                     endConn:Disconnect()
+                    hideDragBlocker()
                     if not moved then
                         setState(not state)
                     end
@@ -2105,6 +2029,7 @@ Sidebar.InputBegan:Connect(function(input)
     dragStartX, dragStartY = p.X, p.Y
     startFramePos = MainFrame.Position
     startShadowPos = Shadow.Position
+    showDragBlocker()
     activeDrag = {
         onMove = function(x, y)
             local dx, dy = x - dragStartX, y - dragStartY
@@ -2116,6 +2041,9 @@ Sidebar.InputBegan:Connect(function(input)
                 startShadowPos.X.Scale, startShadowPos.X.Offset + dx,
                 startShadowPos.Y.Scale, startShadowPos.Y.Offset + dy
             )
+        end,
+        onEnd = function()
+            hideDragBlocker()
         end,
     }
 end)
@@ -2240,19 +2168,20 @@ task.spawn(function()
             if S.statusAcc.Text ~= "manual" then S.statusAcc.Text = "manual" end
             S.accuracySlider.sub.Text = "manual"
         end
-        local netText
-        if S.unlimitedKbps and S.raknetAvailable then
-            netText = string.format("RAKNET (%d q)", #S.raknetQueue)
-            S.statusNet.TextColor3 = Theme.accent
-        elseif S.raknetAvailable then
-            netText = "Roblox (raknet ready)"
-            S.statusNet.TextColor3 = Theme.textMuted
+        if S.spamState.enabled then
+            local cutoff = os.clock() - 1
+            local rpsCount = 0
+            for i = 1, PI.ring_size do
+                if PI.ring[i] > cutoff then rpsCount = rpsCount + 1 end
+            end
+            local rText = tostring(rpsCount)
+            if S.statusRPS.Text ~= rText then S.statusRPS.Text = rText end
+            S.statusRPS.TextColor3 = Theme.accent
         else
-            netText = "Roblox (no raknet)"
-            S.statusNet.TextColor3 = Theme.textDim
+            if S.statusRPS.Text ~= "0" then S.statusRPS.Text = "0" end
+            S.statusRPS.TextColor3 = Theme.textDim
         end
-        if S.statusNet.Text ~= netText then S.statusNet.Text = netText end
-        task.wait(0.05)
+        task.wait(0.1)
     end
 end)
 
@@ -2324,6 +2253,7 @@ MiniButton.InputBegan:Connect(function(input)
     local startX, startY = input.Position.X, input.Position.Y
     local startPos = MiniButton.Position
     local moved = false
+    showDragBlocker()
     activeDrag = {
         onMove = function(x, y)
             local dx, dy = x - startX, y - startY
@@ -2334,6 +2264,7 @@ MiniButton.InputBegan:Connect(function(input)
             )
         end,
         onEnd = function()
+            hideDragBlocker()
             if not moved then setMinimized(false) end
         end,
     }
@@ -2345,8 +2276,6 @@ MiniButton.MouseButton2Click:Connect(function()
     S.triggerEnabled = false
     S.orbit.enabled = false
     S.rageOrbit.enabled = false
-    S.infiniteMode = false
-    S.unlimitedKbps = false
     if S.refreshLoopConn then S.refreshLoopConn:Disconnect() end
     if S.noRender.enabled then disableNoRender() end
     ScreenGui:Destroy()
@@ -2355,3 +2284,5 @@ end)
 closeBtn.MouseButton1Click:Connect(function()
     setMinimized(true)
 end)
+
+applyRPS(240)
