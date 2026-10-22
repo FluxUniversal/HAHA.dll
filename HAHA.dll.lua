@@ -24,7 +24,7 @@ local S = {
     keybinds = { spam = Enum.KeyCode.X, trigger = Enum.KeyCode.C, orbit = Enum.KeyCode.O },
     orbit = { enabled = false, angle = 0, radius = 12, speed = 6, lastTick = os.clock() },
     rageOrbit = { enabled = false, cooldown = 0, studs = 23 },
-    spamState = { enabled = false, rate = 500, accumulator = 0, lastFrame = os.clock() },
+    spamState = { enabled = false, rate = 100, accumulator = 0, lastFrame = os.clock(), maxDt = 0.05, maxGuard = 20 },
     remotesHook = { mt = {}, orig = {}, captured = {}, tokenFn = nil, firstSignal = nil, done = false, descConn = nil },
     noRender = {
         enabled = false,
@@ -34,7 +34,13 @@ local S = {
     },
     armingBox = nil,
     armingKey = nil,
-    unlimitedMode = false,
+    unlimitedKbps = false,
+    raknet = nil,
+    raknetAvailable = false,
+    raknetQueue = {},
+    raknetQueueLimit = 512,
+    lastRaknetFlush = 0,
+    infiniteMode = false,
     alive = true,
     hotRemote = nil,
     hotArgs1 = nil,
@@ -52,6 +58,8 @@ local S = {
     cachedScale = 0.5,
     lastPayloadRefresh = 0,
     lastScreenRefresh = 0,
+    payloadRefreshThreshold = 0.016,
+    screenRefreshThreshold = 0.016,
     cachedTargetPos = nil,
     lastTargetRefresh = 0,
     targetRefreshInterval = 0.1,
@@ -65,12 +73,15 @@ local S = {
     aliveFolderCacheAt = 0,
     refreshLoopConn = nil,
     triggerEnabled = false,
+    infiniteBurst = 40,
+    infiniteBurstKB = 50,
     orbBallsCache = nil,
     orbBallsCacheAt = 0,
     ballPositions = {},
     ballDebounce = false,
     ballUntilAt = 0,
     ballState = { LerpRadians = 0, LastWarping = os.clock(), Curving = os.clock(), AerodynamicTime = os.clock() },
+    ballReplicator = nil,
     ballTriggerTimes = setmetatable({}, {__mode = "k"}),
     spamButton = nil,
     triggerButton = nil,
@@ -84,26 +95,19 @@ local S = {
     orbitToggle = nil,
     rageOrbitToggle = nil,
     infiniteToggle = nil,
-    parryState = {
-        debounce = false,
-        untilAt = 0,
-        accuracy = 1.5,
-    },
-    fireCount = { count = 0, firstSignal = nil },
-    animState = {
-        active = nil,
-        cache = {},
-        tracks = {},
-        api = nil,
-        generation = 0,
-        lastSpam = 0,
-        cancelDelay = 0.12,
-        cancelFraction = 0.35,
-    },
+    unlimitedToggle = nil,
+    unlimitedWarn = nil,
 }
 
-local UNLIMITED_BURST = 40
-local STANDARD_BURST_CAP = 30
+do
+    S.raknet = rawget(getfenv(), "raknet") or rawget(getfenv(), "rnet") or (getgenv and getgenv().raknet) or (getgenv and getgenv().rnet)
+    if S.raknet then
+        local ok = pcall(function() return S.raknet.sendraw end)
+        if ok and type(S.raknet.sendraw) == "function" then
+            S.raknetAvailable = true
+        end
+    end
+end
 
 local function keyName(k)
     if not k then return "None" end
@@ -121,7 +125,7 @@ end
 
 local function updateAccuracyEstimate()
     local now = os.clock()
-    if now - S.lastPingSampleTime >= 0.15 then
+    if now - S.lastPingSampleTime >= 0.2 then
         S.lastPingSampleTime = now
         local raw = dataPing:GetValue()
         if S.pingSmoothed == 0 then
@@ -141,19 +145,23 @@ local function updateAccuracyEstimate()
         else
             local p = S.pingSmoothed
             local pingFactor
-            if p <= 60 then pingFactor = 1
-            elseif p >= 2000 then pingFactor = 0.25
-            else pingFactor = 1 - ((p - 60) / 1940) * 0.75 end
-            local jitterFactor = math.clamp(1 - (S.pingJitter / 250), 0.55, 1)
-            S.cachedEffectiveAccuracy = math.clamp(S.CONFIG.Accuracy * pingFactor * jitterFactor, 1, 100)
+            if p <= 80 then pingFactor = 1
+            elseif p >= 2000 then pingFactor = 0.35
+            else pingFactor = 1 - ((p - 80) / 1920) * 0.65 end
+            local jitterFactor = math.clamp(1 - (S.pingJitter / 300), 0.6, 1)
+            S.cachedEffectiveAccuracy = S.CONFIG.Accuracy * pingFactor * jitterFactor
         end
-        S.parryState.accuracy = (S.cachedEffectiveAccuracy - 1) * 0.01515151515
     end
 end
 
 local function getEffectiveAccuracy()
     updateAccuracyEstimate()
     return S.cachedEffectiveAccuracy
+end
+
+local function getAccuracyMultiplier()
+    updateAccuracyEstimate()
+    return 100 / S.cachedEffectiveAccuracy
 end
 
 local function getLocalHRP()
@@ -470,7 +478,7 @@ end
 
 local function refreshPayload()
     local now = os.clock()
-    if now - S.lastPayloadRefresh < 0.016 then return end
+    if now - S.lastPayloadRefresh < S.payloadRefreshThreshold then return end
     S.lastPayloadRefresh = now
     refreshTarget()
     S.cachedScale = S.CONFIG.FireArg
@@ -480,7 +488,7 @@ local function refreshPayload()
     else
         S.cachedCframe = camCFrame
     end
-    if now - S.lastScreenRefresh >= 0.016 then
+    if now - S.lastScreenRefresh >= S.screenRefreshThreshold then
         S.lastScreenRefresh = now
         table.clear(S.cachedScreen)
         local aliveFolder = getAliveFolder()
@@ -528,6 +536,30 @@ local function fireServer()
     return true
 end
 
+do
+    local net = ReplicatedStorage:FindFirstChild("Packages")
+        and ReplicatedStorage.Packages:FindFirstChild("_Index")
+        and ReplicatedStorage.Packages._Index:FindFirstChild("sleitnick_net@0.1.0")
+        and ReplicatedStorage.Packages._Index["sleitnick_net@0.1.0"]:FindFirstChild("net")
+    if net then
+        for _, child in ipairs(net:GetChildren()) do
+            if child:IsA("UnreliableRemoteEvent") and child.Name ~= "URE/ReplicateBallPosition" then
+                S.ballReplicator = child
+                break
+            end
+        end
+    end
+end
+
+local ballsFolder = ws:FindFirstChild("Balls")
+if S.ballReplicator and ballsFolder then
+    S.ballReplicator.OnClientEvent:Connect(function(ball, pos)
+        if ball and ball.Parent == ballsFolder and ball:GetAttribute("realBall") == true then
+            S.ballPositions[ball] = pos
+        end
+    end)
+end
+
 local function getRealBalls()
     local balls = ws:FindFirstChild("Balls")
     if not balls then return {} end
@@ -555,7 +587,7 @@ local function triggerFire(ball)
         end
     end
     local now = os.clock()
-    if now - (S.ballTriggerTimes[ball] or 0) < 0.001 then return end
+    if now - (S.ballTriggerTimes[ball] or 0) < 0.015 then return end
     S.ballTriggerTimes[ball] = now
     refreshPayload()
     local cf = CFrame.new(Camera.CFrame.Position, S.ballPositions[ball] or ball.Position)
@@ -601,8 +633,8 @@ end
 
 local function bindBall(ball)
     local function onChange()
-        S.parryState.debounce = false
-        S.parryState.untilAt = 0
+        S.ballDebounce = false
+        S.ballUntilAt = 0
         triggerFire(ball)
     end
     ball:GetAttributeChangedSignal("target"):Connect(onChange)
@@ -614,15 +646,14 @@ task.spawn(function()
     local balls = ws:WaitForChild("Balls", 10)
     if not balls then return end
     balls.ChildAdded:Connect(function(child)
-        S.parryState.debounce = false
-        S.parryState.untilAt = 0
+        S.ballDebounce = false
+        S.ballUntilAt = 0
         bindBall(child)
     end)
     balls.ChildRemoved:Connect(function(child)
         S.ballPositions[child] = nil
-        S.parryState.debounce = false
-        S.parryState.untilAt = 0
-        S.fireCount.count = 0
+        S.ballDebounce = false
+        S.ballUntilAt = 0
     end)
     for _, child in ipairs(balls:GetChildren()) do
         bindBall(child)
@@ -838,373 +869,84 @@ local function disableNoRender()
     restoreNoRender()
 end
 
-local animState = S.animState
-local fireCount = S.fireCount
-local parryState = S.parryState
-
-pcall(function()
-    animState.api = require(ReplicatedStorage.Shared.SwordAPI)
-end)
-
-LocalPlayer.CharacterAdded:Connect(function()
-    table.clear(animState.tracks)
-    animState.active = nil
-    animState.generation = animState.generation + 1
-    animState.lastSpam = 0
-end)
-
-local function findSwordAnim(parent)
-    local grabParry = parent:FindFirstChild("GrabParry")
-        or parent:FindFirstChild("Parry")
-        or parent:FindFirstChild("Grab")
-    if grabParry then return grabParry end
-    local base = parent:FindFirstChild("Base")
-    if base then
-        return base:FindFirstChild("GrabParry")
-            or base:FindFirstChild("Parry")
-            or base:FindFirstChild("Grab")
-    end
-    return nil
+local function refreshGuard()
+    local base = S.unlimitedKbps and 0.15 or 0.05
+    S.spamState.maxDt = base
+    S.spamState.maxGuard = math.max(20, math.floor(S.spamState.rate * base * 2))
 end
 
-local function resolveSwordAnim(character, swordName)
-    if not swordName then return nil end
-    if animState.cache[swordName] and animState.cache[swordName].Parent then
-        return animState.cache[swordName]
-    end
-    local shared = ReplicatedStorage:FindFirstChild("Shared")
-    if not shared then return nil end
-    local replicatedInstances = shared:FindFirstChild("ReplicatedInstances")
-    local swords = replicatedInstances and replicatedInstances:FindFirstChild("Swords")
-    local getSword = swords and swords:FindFirstChild("GetSword")
-    local swordData = nil
-    if getSword then
-        pcall(function()
-            swordData = getSword:Invoke(swordName)
-        end)
-    end
-    local animationType = swordData and swordData.AnimationType or "Single"
-    local swordType = swordData and swordData.SwordType or "Single"
-
-    if animState.api and type(animState.api.GetAnimations) == "function" then
-        local ok, anims = pcall(function()
-            return animState.api:GetAnimations(character, { "Parry", "GrabParry" }, animationType, swordType)
-        end)
-        if ok and type(anims) == "table" and anims[1] then
-            animState.cache[swordName] = anims[1]
-            return anims[1]
-        end
-    end
-
-    local swordAPI = shared:FindFirstChild("SwordAPI")
-    if swordAPI then
-        swordAPI = swordAPI:FindFirstChild("Collection") or swordAPI
-    end
-    if swordAPI then
-        local animTypeFolder = swordAPI:FindFirstChild(animationType)
-        if animTypeFolder then
-            local found = findSwordAnim(animTypeFolder)
-            if found then
-                animState.cache[swordName] = found
-                return found
-            end
-        end
-        local defaultFolder = swordAPI:FindFirstChild("Default")
-        if defaultFolder then
-            local found = findSwordAnim(defaultFolder)
-            if found then
-                animState.cache[swordName] = found
-                return found
-            end
-        end
-    end
-    return nil
-end
-
-local function grabParry(spamMode)
-    local character = LocalPlayer.Character
-    if not character then return false end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local animator = humanoid and humanoid:FindFirstChildOfClass("Animator")
-    if not humanoid or not animator then return false end
-
-    local swordName = character:GetAttribute("CurrentlyEquippedSword") or "Base Sword"
-    local anim = resolveSwordAnim(character, swordName)
-    if not anim then return false end
-
-    local trackCache = animState.tracks[animator]
-    if not trackCache then
-        trackCache = {}
-        animState.tracks[animator] = trackCache
-    end
-
-    local track = trackCache[anim]
-    if not track or not track.Parent or track.Parent ~= animator then
-        local ok, newTrack = pcall(function()
-            return animator:LoadAnimation(anim)
-        end)
-        if not ok or not newTrack then return false end
-        for k, v in anim:GetAttributes() do
-            newTrack:SetAttribute(k, v)
-        end
-        newTrack:SetAttribute("GrabParry", true)
-        newTrack.Priority = Enum.AnimationPriority.Action4
-        trackCache[anim] = newTrack
-        track = newTrack
-    end
-
-    if spamMode then
-        local now = os.clock()
-        if now - animState.lastSpam < animState.cancelDelay then
-            local stillPlaying = false
-            if animState.active then
-                pcall(function()
-                    stillPlaying = animState.active.IsPlaying
-                end)
-            end
-            if stillPlaying then
-                character:SetAttribute("ParryTime", math.max(
-                    character:GetAttribute("ParryTime") or 0,
-                    animState.active.Length ~= 0 and animState.active.Length or 1
-                ))
-                return true
-            end
-        end
-        animState.lastSpam = now
-    else
-        animState.lastSpam = 0
-    end
-
-    animState.generation = animState.generation + 1
-    local generation = animState.generation
-
-    for _, playingTrack in animator:GetPlayingAnimationTracks() do
-        if playingTrack:GetAttribute("GrabParry")
-            or playingTrack:GetAttribute("Parry")
-            or playingTrack:GetAttribute("SuccessParry") then
-            pcall(playingTrack.Stop, playingTrack, playingTrack:GetAttribute("StopFadeTime") or 0.05)
-        end
-    end
-
-    local playFadeTime = anim:GetAttribute("PlayFadeTime") or 0.05
-    local playWeight = anim:GetAttribute("PlayWeight") or 1
-    local playSpeed = anim:GetAttribute("PlaySpeed") or 1
-    track.TimePosition = 0
-    track:Play(playFadeTime, playWeight, playSpeed)
-    animState.active = track
-
-    character:SetAttribute("ParryTime", math.max(
-        character:GetAttribute("ParryTime") or 0,
-        track.Length ~= 0 and (track.Length - track.TimePosition) * playSpeed or 1
-    ))
-
-    if spamMode then
-        local cancelDelay = animState.cancelDelay
-        local animLength = track.Length or 0
-        local cancelAt
-        if animLength > 0 then
-            cancelAt = math.min(cancelDelay, animLength * animState.cancelFraction)
-        else
-            cancelAt = cancelDelay
-        end
-        if cancelAt < 0.05 then cancelAt = 0.05 end
-        local thisTrack = track
-        local stopFadeTime = anim:GetAttribute("StopFadeTime") or 0.05
-        task.delay(cancelAt, function()
-            if generation ~= animState.generation or animState.active ~= thisTrack then
-                return
-            end
-            pcall(thisTrack.Stop, thisTrack, stopFadeTime)
-        end)
-    end
-
+local function queueRaknetFire(remote)
+    if not S.raknetAvailable or not S.unlimitedKbps then return false end
+    local q = S.raknetQueue
+    if #q >= S.raknetQueueLimit then return false end
+    q[#q + 1] = remote
     return true
 end
 
-local function fireCountFire(spamMode)
-    local currentCamera = Camera
-
-    local camCFrame = currentCamera.CFrame
-    local screenPos
-    local mouseLoc = UserInputService:GetMouseLocation()
-    screenPos = { mouseLoc.X, mouseLoc.Y }
-
-    local screenTable = {}
-    local aliveFolder = getAliveFolder()
-    if aliveFolder then
-        for _, char in ipairs(aliveFolder:GetChildren()) do
-            local primaryPart = char.PrimaryPart
-            if primaryPart then
-                local screen = currentCamera:WorldToScreenPoint(primaryPart.Position)
-                if screen and screen.Z > 0 then
-                    screenTable[char.Name] = screen
-                end
-            end
-        end
-    end
-
-    if next(S.remotesHook.captured) == nil then
-        if not fireCount.firstSignal then
-            local okSig, Signal = pcall(function()
-                return require(ReplicatedStorage.Packages.Signal)
-            end)
-            if okSig then
-                fireCount.firstSignal = Signal.new()
-                local okPRY, PRY = pcall(function()
-                    local ctrl = ReplicatedStorage.Controllers
-                    local swordCtrl = ctrl:FindFirstChild("SwordsController " .. string.char(12))
-                        or ctrl:FindFirstChild("SwordsController")
-                    return require(swordCtrl.PRY)
-                end)
-                if okPRY then
-                    fireCount.firstSignal:Connect(PRY)
-                end
-            end
-        end
-        if fireCount.firstSignal then
-            fireCount.firstSignal:Fire(0.5, camCFrame, screenTable, screenPos, false)
-        end
-        if spamMode then grabParry(true) end
-    else
-        grabParry(spamMode)
-
-        for remote, args in next, S.remotesHook.captured do
-            local fireArgs = {}
-            local tok = fastTokenize()
-            fireArgs[1] = args[1]
-            fireArgs[2] = args[2]
-            fireArgs[3] = tok
-            fireArgs[4] = 0.5
-            fireArgs[5] = camCFrame
-            fireArgs[6] = screenTable
-            fireArgs[7] = screenPos
-            fireArgs[8] = false
-            if remote:IsA("RemoteEvent") then
-                remote:FireServer(table.unpack(fireArgs))
-            elseif remote:IsA("RemoteFunction") then
-                remote:InvokeServer(table.unpack(fireArgs))
-            end
-        end
-    end
-
-    if fireCount.count > 7 then return false end
-    fireCount.count = fireCount.count + 1
-    task.delay(0.5, function()
-        if fireCount.count > 0 then
-            fireCount.count = fireCount.count - 1
-        end
-    end)
-    return true
-end
-
-local function checkParry()
-    if not S.remotesHook.tokenFn then return end
-    local character = LocalPlayer.Character
-    local hrp = character and character.PrimaryPart
-    if not hrp then return end
+local function flushRaknetQueue()
+    if not S.raknetAvailable or not S.unlimitedKbps then return end
+    local q = S.raknetQueue
+    if #q == 0 then return end
     local now = os.clock()
-    if parryState.debounce or now < parryState.untilAt then return end
+    if now - S.lastRaknetFlush < 0.004 then return end
+    S.lastRaknetFlush = now
 
-    local position = hrp.Position
-    local pingRange = math.clamp(dataPing:GetValue() / 10 / 10, 5, 17)
+    refreshCachedToken()
+    refreshPayload()
 
-    local balls = ws:FindFirstChild("Balls")
-    if not balls then return end
-    local allBalls = getRealBalls()
-    if #allBalls == 0 then return end
+    local rn = S.raknet
+    local tok = S.cachedToken
+    local sc = S.cachedScale
+    local cf = S.cachedCframe
+    local scr = S.cachedScreen
+    local aim = S.cachedAim
+    local a1 = S.hotArgs1
+    local a2 = S.hotArgs2
 
-    local firstBall = allBalls[1]
-    local firstTarget = firstBall:GetAttribute("target")
-    local runtime = ws:FindFirstChild("Runtime")
-    local tornado = runtime and runtime:FindFirstChild("Tornado")
-    local tornadoTime = (tornado and tornado:GetAttribute("TornadoTime")) or 1
-
-    for _, ball in ipairs(allBalls) do
-        local zoomies = ball:FindFirstChild("zoomies")
-        if zoomies then
-            local target = ball:GetAttribute("target")
-            local speed = zoomies.VectorVelocity.Magnitude
-            local dist = (position - getBallPosition(ball)).Magnitude
-            local divisor = (2.4 + math.min(math.max(speed - 9.5, 0), 650) * 0.002) * parryState.accuracy
-
-            local aero = ball:FindFirstChild("AeroDynamicSlashVFX")
-            if aero then
-                Debris:AddItem(aero, 0)
-                S.ballState.AerodynamicTime = now
+    local maxPerFlush = 32
+    local sent = 0
+    local i = 1
+    while i <= #q and sent < maxPerFlush do
+        local remote = q[i]
+        i = i + 1
+        sent = sent + 1
+        local bytes
+        if rn.fire then
+            local ok, data = pcall(rn.fire, remote, a1, a2, tok, sc, cf, scr, aim, false)
+            if ok then bytes = data end
+        elseif rn.encodeRemote then
+            local ok, data = pcall(rn.encodeRemote, remote, {a1, a2, tok, sc, cf, scr, aim, false})
+            if ok then bytes = data end
+        end
+        if not bytes then
+            S.unlimitedKbps = false
+            if S.unlimitedToggle then S.unlimitedToggle.set(false) end
+            if S.unlimitedWarn then
+                S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
+                S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (encode failed)"
             end
-
-            if tornado and now - S.ballState.AerodynamicTime < tornadoTime + 0.314159 then
-                return
+            break
+        end
+        local okSend = pcall(rn.sendraw, bytes)
+        if not okSend then
+            S.unlimitedKbps = false
+            if S.unlimitedToggle then S.unlimitedToggle.set(false) end
+            if S.unlimitedWarn then
+                S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
+                S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (sendraw failed)"
             end
-
-            if firstTarget == localName and isCurved(firstBall) then
-                return
-            end
-
-            if target == localName
-                and dist <= pingRange + math.max(speed / divisor, 9.5)
-                and parryState.accuracy * 0.8 then
-                fireCountFire(false)
-                parryState.debounce = true
-                parryState.untilAt = now + 1
-                return
-            end
+            break
         end
     end
-end
 
-local function retryParry(resultChar, hitChar)
-    if hitChar and hitChar.Parent and hitChar.Parent ~= LocalPlayer.Character and hitChar.Parent.Parent ~= ws.Alive then
-        return
-    end
-    local balls = ws:FindFirstChild("Balls")
-    if not balls then return end
-    local allBalls = getRealBalls()
-    if #allBalls == 0 then return end
-
-    local currentBall = allBalls[1]
-    local character = LocalPlayer.Character
-    if not character or not character.PrimaryPart then return end
-
-    local position = character.PrimaryPart.Position
-    local ballPos = getBallPosition(currentBall)
-
-    local toBall = position - ballPos
-    local distToBall = toBall.Magnitude
-    if distToBall < 0.01 then return end
-    local unit = toBall / distToBall
-    local velUnit = currentBall.AssemblyLinearVelocity.Unit
-    local dot = unit:Dot(velUnit)
-
-    if distToBall < 15 and dot > -0.25 and isCurved(currentBall) then
-        fireCountFire(false)
-    end
-end
-
-local function onParrySuccess()
-    local character = LocalPlayer.Character
-    if not character or not character:IsDescendantOf(ws) then return end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    humanoid = humanoid and humanoid:FindFirstChildOfClass("Animator")
-    if not humanoid then return end
-    animState.generation = animState.generation + 1
-    animState.lastSpam = 0
-    for _, track in humanoid:GetPlayingAnimationTracks() do
-        if track:GetAttribute("GrabParry") or track:GetAttribute("Parry") then
-            track:Stop(track:GetAttribute("StopFadeTime"))
+    if i > 1 then
+        local newQ = {}
+        local n = 0
+        for j = i, #q do
+            n = n + 1
+            newQ[n] = q[j]
         end
-    end
-end
-
-do
-    local RemotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
-    local ParrySuccessAll = RemotesFolder and RemotesFolder:FindFirstChild("ParrySuccessAll")
-    if ParrySuccessAll then
-        ParrySuccessAll.OnClientEvent:Connect(retryParry)
-    end
-    local ParrySuccess = RemotesFolder and RemotesFolder:FindFirstChild("ParrySuccess")
-    if ParrySuccess then
-        ParrySuccess.OnClientEvent:Connect(onParrySuccess)
+        S.raknetQueue = newQ
     end
 end
 
@@ -1221,6 +963,84 @@ local function refreshSpamArgs()
     arg8 = false
 end
 
+local function fireBurst(remote, fn, count)
+    local a1, a2, a3, a4, a5, a6, a7, a8 = arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
+    if S.unlimitedKbps and S.raknetAvailable then
+        local i = 0
+        while i < count do
+            if not queueRaknetFire(remote) then break end
+            i = i + 1
+        end
+        return
+    end
+    local i = 0
+    while i + 8 <= count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 8
+    end
+    while i + 4 <= count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 4
+    end
+    while i < count do
+        fn(remote, a1, a2, a3, a4, a5, a6, a7, a8)
+        i = i + 1
+    end
+end
+
+local function doSpamTick()
+    local spamState = S.spamState
+    if not spamState.enabled then return end
+    if not S.hotRemote or not S.fireMethod then
+        if next(S.remotesHook.captured) ~= nil then refreshHot() end
+        if not S.hotRemote or not S.fireMethod then return end
+    end
+
+    local remote = S.hotRemote
+    local method = S.fireMethod
+
+    if S.infiniteMode then
+        refreshPayload()
+        refreshCachedToken()
+        refreshSpamArgs()
+        local burst = S.unlimitedKbps and S.infiniteBurstKB or S.infiniteBurst
+        fireBurst(remote, method, burst)
+        return
+    end
+
+    local now = os.clock()
+    local dt = now - spamState.lastFrame
+    spamState.lastFrame = now
+    local maxDt = spamState.maxDt
+    if dt > maxDt then dt = maxDt end
+
+    local rate = spamState.rate
+    local acc = spamState.accumulator + dt * rate
+    if acc < 1 then
+        spamState.accumulator = acc
+        return
+    end
+    local guard = spamState.maxGuard
+    if acc > guard then acc = guard end
+    local count = math.floor(acc)
+    spamState.accumulator = acc - count
+
+    refreshPayload()
+    refreshCachedToken()
+    refreshSpamArgs()
+    fireBurst(remote, method, count)
+end
+
 local function ensureHot()
     if S.hotRemote and S.fireMethod then
         if S.refreshLoopConn then
@@ -1232,60 +1052,50 @@ local function ensureHot()
     if next(S.remotesHook.captured) ~= nil then
         refreshHot()
     end
-end
-
-local function doSpamTick()
-    if S.unlimitedMode then
-        if not S.hotRemote or not S.fireMethod then
-            if next(S.remotesHook.captured) ~= nil then refreshHot() end
-            if not S.hotRemote or not S.fireMethod then return end
-        end
-        refreshPayload()
-        refreshCachedToken()
-        refreshSpamArgs()
-        local remote = S.hotRemote
-        local fn = S.fireMethod
-        for i = 1, UNLIMITED_BURST do
-            fn(remote, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-        end
-        return
-    end
-
-    if not S.spamState.enabled then return end
-
-    local now = os.clock()
-    local dt = now - S.spamState.lastFrame
-    S.spamState.lastFrame = now
-
-    S.spamState.accumulator = S.spamState.accumulator + dt * S.spamState.rate
-    if S.spamState.accumulator < 1 then return end
-
-    if not S.hotRemote or not S.fireMethod then
-        if next(S.remotesHook.captured) ~= nil then refreshHot() end
-        if not S.hotRemote or not S.fireMethod then return end
-    end
-
-    local count = math.min(math.floor(S.spamState.accumulator), STANDARD_BURST_CAP)
-    S.spamState.accumulator = S.spamState.accumulator - count
-
-    refreshPayload()
-    refreshCachedToken()
-    refreshSpamArgs()
-
-    local remote = S.hotRemote
-    local fn = S.fireMethod
-    for i = 1, count do
-        fn(remote, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+    if S.hotRemote and S.fireMethod and S.refreshLoopConn then
+        S.refreshLoopConn:Disconnect()
+        S.refreshLoopConn = nil
     end
 end
 
 S.refreshLoopConn = RunService.Heartbeat:Connect(ensureHot)
 RunService.PreSimulation:Connect(doSpamTick)
 RunService.Heartbeat:Connect(doSpamTick)
-RunService.PostSimulation:Connect(function()
-    if not AutoParry then return end
-    checkParry()
+RunService.RenderStepped:Connect(function()
+    flushRaknetQueue()
 end)
+
+local function setUnlimitedKbps(enabled)
+    if enabled and not S.raknetAvailable then
+        S.unlimitedKbps = false
+        if S.unlimitedToggle then S.unlimitedToggle.set(false) end
+        if S.unlimitedWarn then
+            S.unlimitedWarn.TextColor3 = Color3.fromRGB(240, 100, 100)
+            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (not detected)"
+        end
+        return
+    end
+    S.unlimitedKbps = enabled
+    S.screenRefreshThreshold = enabled and 1.0 or 0.016
+    S.payloadRefreshThreshold = enabled and 0.05 or 0.016
+    refreshGuard()
+    S.spamState.accumulator = 0
+    S.spamState.lastFrame = os.clock()
+    if enabled then
+        S.raknetQueue = {}
+        S.lastRaknetFlush = 0
+        if S.unlimitedWarn then
+            S.unlimitedWarn.TextColor3 = Color3.fromRGB(245, 190, 100)
+            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (active)"
+        end
+    else
+        S.raknetQueue = {}
+        if S.unlimitedWarn then
+            S.unlimitedWarn.TextColor3 = Color3.fromRGB(150, 150, 160)
+            S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY"
+        end
+    end
+end
 
 local Theme = {
     bg          = Color3.fromRGB(16, 16, 19),
@@ -1509,7 +1319,7 @@ local versionTag = Instance.new("TextLabel")
 versionTag.Size = UDim2.new(1, -24, 0, 16)
 versionTag.Position = UDim2.new(0, 12, 1, -28)
 versionTag.BackgroundTransparency = 1
-versionTag.Text = "v3.3.0"
+versionTag.Text = "v2.2.1"
 versionTag.TextColor3 = Theme.textMuted
 versionTag.Font = Enum.Font.Gotham
 versionTag.TextSize = 9
@@ -2006,8 +1816,8 @@ end)
 makeToggle(perfTab.inner, "No Render", function(s)
     if s then enableNoRender() else disableNoRender() end
 end)
-S.infiniteToggle = makeToggle(perfTab.inner, "Unlimited spam", function(s)
-    S.unlimitedMode = s
+S.infiniteToggle = makeToggle(perfTab.inner, "Infinite spam", function(s)
+    S.infiniteMode = s
     if s then
         if next(S.remotesHook.captured) ~= nil then refreshHot() end
         if not S.refreshLoopConn then
@@ -2016,8 +1826,28 @@ S.infiniteToggle = makeToggle(perfTab.inner, "Unlimited spam", function(s)
     end
 end)
 
-makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 500, S.spamState.rate, function(v)
+S.unlimitedToggle = makeToggle(perfTab.inner, "Unlimited KBPS", function(s)
+    setUnlimitedKbps(s)
+end)
+S.unlimitedWarn = Instance.new("TextLabel")
+S.unlimitedWarn.Size = UDim2.new(1, -8, 0, 16)
+S.unlimitedWarn.BackgroundTransparency = 1
+S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY"
+S.unlimitedWarn.TextColor3 = S.raknetAvailable and Theme.textMuted or Theme.danger
+S.unlimitedWarn.Font = Enum.Font.GothamBold
+S.unlimitedWarn.TextSize = 10
+S.unlimitedWarn.TextXAlignment = Enum.TextXAlignment.Center
+S.unlimitedWarn.ZIndex = 6
+S.unlimitedWarn.LayoutOrder = S.unlimitedToggle.row.LayoutOrder + 1
+S.unlimitedWarn.Parent = perfTab.inner
+if not S.raknetAvailable then
+    S.unlimitedWarn.Text = "MUST USE RAKNET LIBRARY (not detected)"
+    S.unlimitedWarn.TextColor3 = Theme.danger
+end
+
+makeSlider(tuningTab.inner, "Spam rate (/s)", 100, 1000, S.spamState.rate, function(v)
     S.spamState.rate = v
+    refreshGuard()
 end)
 S.accuracySlider = makeSlider(tuningTab.inner, "Accuracy", 40, 100, S.CONFIG.Accuracy, function(v) S.CONFIG.Accuracy = v end)
 makeToggle(tuningTab.inner, "Auto accuracy", function(s)
@@ -2078,7 +1908,7 @@ end
 S.statusVelocity = makeStatRow(12, "Ball velocity")
 S.statusPing = makeStatRow(44, "Ping")
 S.statusAcc = makeStatRow(76, "Effective accuracy")
-S.statusNet = makeStatRow(108, "Network mode")
+S.statusNet = makeStatRow(108, "Network path")
 
 currentTab = "Combat"
 pages["Combat"].page.Visible = true
@@ -2318,6 +2148,58 @@ UserInputService.InputBegan:Connect(function(input, gp)
     end
 end)
 
+local function checkParry()
+    local char = LocalPlayer.Character
+    local hrp = char and char.PrimaryPart
+    if not hrp then return end
+    local t = os.clock()
+    if S.ballDebounce or t < S.ballUntilAt then return end
+    if not S.remotesHook.tokenFn then return end
+    local pos = hrp.Position
+    local pingVal = S.pingSmoothed > 0 and S.pingSmoothed or dataPing:GetValue()
+    local pingRange = math.clamp(pingVal / 100, 5, 18)
+    local accuracyMult = getAccuracyMultiplier()
+    local allBalls = getRealBalls()
+    if #allBalls == 0 then return end
+    local firstBall = allBalls[1]
+    local firstTarget = firstBall:GetAttribute("target")
+    local runtime = ws:FindFirstChild("Runtime")
+    local tornado = runtime and runtime:FindFirstChild("Tornado")
+    local tornadoTime = (tornado and tornado:GetAttribute("TornadoTime")) or 0
+    for _, ball in ipairs(allBalls) do
+        local zoomies = ball:FindFirstChild("zoomies")
+        if zoomies then
+            local target = ball:GetAttribute("target")
+            local speed = zoomies.VectorVelocity.Magnitude
+            local dist = (pos - getBallPosition(ball)).Magnitude
+            local divisor = 2.4 + math.min(math.max(speed - 9.5, 0), 650) * 0.002
+            divisor = divisor / accuracyMult
+            if divisor <= 0.01 then divisor = 0.01 end
+            local threshold = pingRange + math.max(speed / divisor, 9.5)
+            local aero = ball:FindFirstChild("AeroDynamicSlashVFX")
+            if aero then
+                Debris:AddItem(aero, 0)
+                S.ballState.AerodynamicTime = t
+            end
+            if tornado and (t - S.ballState.AerodynamicTime < tornadoTime + 0.314159) then continue end
+            if firstTarget == localName and isCurved(firstBall) then continue end
+            if target ~= localName then continue end
+            if dist > threshold then continue end
+            if accuracyMult > 2 then continue end
+            if pcall(fireServer) then
+                S.ballDebounce = true
+                S.ballUntilAt = t + 1
+            end
+            return
+        end
+    end
+end
+
+RunService.PostSimulation:Connect(function()
+    if not AutoParry then return end
+    checkParry()
+end)
+
 RunService.Heartbeat:Connect(function()
     if not S.orbit.enabled then return end
     local now = os.clock()
@@ -2358,9 +2240,18 @@ task.spawn(function()
             if S.statusAcc.Text ~= "manual" then S.statusAcc.Text = "manual" end
             S.accuracySlider.sub.Text = "manual"
         end
-        local netText = S.unlimitedMode and "Unlimited (40/tick)" or "Standard"
+        local netText
+        if S.unlimitedKbps and S.raknetAvailable then
+            netText = string.format("RAKNET (%d q)", #S.raknetQueue)
+            S.statusNet.TextColor3 = Theme.accent
+        elseif S.raknetAvailable then
+            netText = "Roblox (raknet ready)"
+            S.statusNet.TextColor3 = Theme.textMuted
+        else
+            netText = "Roblox (no raknet)"
+            S.statusNet.TextColor3 = Theme.textDim
+        end
         if S.statusNet.Text ~= netText then S.statusNet.Text = netText end
-        S.statusNet.TextColor3 = S.unlimitedMode and Theme.accent or Theme.textMuted
         task.wait(0.05)
     end
 end)
@@ -2454,7 +2345,8 @@ MiniButton.MouseButton2Click:Connect(function()
     S.triggerEnabled = false
     S.orbit.enabled = false
     S.rageOrbit.enabled = false
-    S.unlimitedMode = false
+    S.infiniteMode = false
+    S.unlimitedKbps = false
     if S.refreshLoopConn then S.refreshLoopConn:Disconnect() end
     if S.noRender.enabled then disableNoRender() end
     ScreenGui:Destroy()
